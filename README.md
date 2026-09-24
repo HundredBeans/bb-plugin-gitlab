@@ -28,9 +28,11 @@ thread links survive it.
 - **Sidebar panel** (GitLab tanuki, full width): Issues and Merge requests tabs
   across every tracked project, one filter box that takes qualifiers —
   `is:open`, `is:draft`, `assignee:@me`, `author:dana`, `label:"needs triage"`,
-  `project:gitlab.com/acme/web`, `no:assignee`, `no:label` — plus plain text,
-  completed from the loaded items and driven by the keyboard (↑/↓, Enter or Tab
-  to accept, Escape to dismiss). The query persists in localStorage.
+  `project:gitlab.com/acme/web`, `no:assignee`, `no:label`, and on merge
+  requests `reviewer:@me` and `no:reviewer` — plus plain text, completed from
+  the loaded items and driven by the keyboard (↑/↓, Enter or Tab to accept,
+  Escape to dismiss). A project picker beside the tabs edits the same
+  `project:` token. The query persists in localStorage.
 - **Issue detail**: markdown description, notes, comment box, state, assignee
   and label editing, plus "Send agent". Deep-linkable through the URL hash:
   `#/issues/<host>/<namespace/path>/<iid>`.
@@ -63,7 +65,6 @@ thread links survive it.
 - **Send agent / Review with agent**: spawns a BB worker thread on the issue (or
   a review thread on the merge request) in the matching BB project. The item
   then shows a ⚡ pill linking to the thread.
-- **Homepage section**: recent open issues with the same Send agent buttons.
 - **Mentions**: `#` completes GitLab issues, `!` completes merge requests (`@`
   does both); the selected item's title, state, and description are attached as
   agent context at send time.
