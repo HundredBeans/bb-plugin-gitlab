@@ -26,6 +26,14 @@ const CLOSED_MR_PAGE = 30;
 const DIFF_PAGE = 100;
 /** Per-file diffs above this size stay on GitLab; the panel links out. */
 const MAX_PATCH_BYTES = 20_000;
+/** Discussion pages (100 each) read for one merge request's timeline. */
+const DISCUSSION_PAGES = 10;
+/** Files above this size are not fetched just to show a thread's lines. */
+const MAX_SNIPPET_FILE_BYTES = 1_000_000;
+/** Lines of code shown around an inline thread's own line(s). */
+const SNIPPET_CONTEXT_BEFORE = 3;
+const SNIPPET_CONTEXT_AFTER = 2;
+const MAX_SNIPPET_LINES = 40;
 
 const GLAB_HINT =
   "Install the GitLab CLI (https://gitlab.com/gitlab-org/cli) and run " +
@@ -52,6 +60,17 @@ const itemInputSchema = z
 const nonBlankStringSchema = z
   .string()
   .refine((value) => value.trim().length > 0, "must not be blank");
+/** A commit sha. Guards merge and approve against a head that moved. */
+const shaSchema = z.string().regex(/^[0-9a-f]{7,64}$/);
+/** GitLab discussion ids are hex digests; they go into a URL path segment. */
+const discussionIdSchema = z.string().regex(/^[0-9a-f]{8,64}$/);
+/** A numeric pipeline or job id. */
+const gitlabIdSchema = z.number().int().positive();
+const repoPathSchema = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine((value) => !value.startsWith("/"), "must be repository-relative");
 const projectInfoSchema = z
   .object({
     project: projectRefSchema,
@@ -98,13 +117,90 @@ const threadLinkSchema = z
     createdAt: z.string(),
   })
   .strict();
-const mergeRequestSchema = z
+/** One note inside a timeline entry. System notes are GitLab's own events. */
+const timelineNoteSchema = z
   .object({
+    id: z.number().int().nonnegative(),
+    author: z.string(),
+    body: z.string(),
+    createdAt: z.string(),
+    system: z.boolean(),
+  })
+  .strict();
+/**
+ * Where an inline thread sits. `side` is the side of the diff the line is
+ * on: "old" only for a removed line, whose text lives in the base commit.
+ * `ref` is the commit holding that copy of the file. Line fields are null for
+ * a comment on a whole file or an image.
+ */
+const diffPositionSchema = z
+  .object({
+    path: z.string(),
+    side: z.enum(["new", "old"]),
+    line: z.number().int().positive().nullable(),
+    /** Last line of a multi-line comment; equals `line` for one line. */
+    endLine: z.number().int().positive().nullable(),
+    ref: z.string().nullable(),
+  })
+  .strict();
+/**
+ * One row of the merge request's activity, in GitLab's order.
+ *
+ * - `event` — a system note: "approved this merge request", "added 1 commit".
+ * - `comment` — a single comment with no replies.
+ * - `thread` — a discussion: a comment on a diff line, or any comment that
+ *   has replies. Replies and resolve address it by `id`.
+ */
+const timelineEntrySchema = z
+  .object({
+    id: z.string(),
+    kind: z.enum(["event", "comment", "thread"]),
+    resolvable: z.boolean(),
+    resolved: z.boolean(),
+    resolvedBy: z.string().nullable(),
+    position: diffPositionSchema.nullable(),
+    notes: z.array(timelineNoteSchema),
+  })
+  .strict();
+const pipelineSchema = z
+  .object({
+    id: z.number().int().positive(),
+    status: z.string(),
+    url: z.string(),
+  })
+  .strict();
+const jobSchema = z
+  .object({
+    id: z.number().int().positive(),
+    name: z.string(),
+    stage: z.string(),
+    /** "warning" is a failed job the pipeline is allowed to ignore. */
+    status: z.enum(["success", "failure", "warning", "pending", "neutral"]),
+    /** GitLab's own word: "manual", "failed", "canceled", "running", … */
+    rawStatus: z.string(),
+    url: z.string(),
+  })
+  .strict();
+/** The parts of a merge request that move while it is open. */
+const mergeRequestStatusSchema = z
+  .object({
+    state: z.string(),
+    draft: z.boolean(),
+    sha: z.string(),
+    /** GitLab's detailed_merge_status, e.g. "mergeable", "need_rebase". */
+    mergeStatus: z.string(),
+    hasConflicts: z.boolean(),
+    /** True while "merge when the pipeline succeeds" is set. */
+    autoMerge: z.boolean(),
+    pipeline: pipelineSchema.nullable(),
+    jobs: z.array(jobSchema),
+  })
+  .strict();
+const mergeRequestSchema = mergeRequestStatusSchema
+  .extend({
     project: projectRefSchema,
     iid: iidSchema,
     title: z.string(),
-    state: z.string(),
-    draft: z.boolean(),
     author: z.string(),
     body: z.string(),
     url: z.string(),
@@ -122,37 +218,24 @@ const mergeRequestSchema = z
     labels: z.array(z.string()),
     assignees: z.array(z.string()),
     reviewers: z.array(z.string()),
-    /** GitLab's detailed_merge_status, e.g. "mergeable", "need_rebase". */
-    mergeStatus: z.string(),
-    hasConflicts: z.boolean(),
     approvalsRequired: z.number().int().nonnegative(),
     approvalsLeft: z.number().int().nonnegative(),
     approvedBy: z.array(z.string()),
-    pipeline: z
-      .object({ status: z.string(), url: z.string() })
-      .strict()
-      .nullable(),
-    jobs: z.array(
-      z
-        .object({
-          name: z.string(),
-          status: z.enum(["success", "failure", "pending", "neutral"]),
-          rawStatus: z.string(),
-          url: z.string(),
-        })
-        .strict(),
-    ),
-    notes: z.array(noteSchema),
-    discussions: z.array(
-      z
-        .object({
-          path: z.string(),
-          line: z.number().int().nonnegative().nullable(),
-          resolved: z.boolean(),
-          notes: z.array(noteSchema),
-        })
-        .strict(),
-    ),
+    userHasApproved: z.boolean(),
+    userCanApprove: z.boolean(),
+    /** GitLab's own answer to "may the viewer merge this?". */
+    canMerge: z.boolean(),
+    /** Merge defaults, as GitLab's own merge widget would pre-fill them. */
+    squash: z.boolean(),
+    /** "always" and "never" lock the squash choice for the project. */
+    squashOption: z.enum(["always", "never", "default_on", "default_off"]),
+    removeSourceBranch: z.boolean(),
+    /** The last merge attempt's error, when GitLab kept one. */
+    mergeError: z.string().nullable(),
+    blockingDiscussionsResolved: z.boolean(),
+    timeline: z.array(timelineEntrySchema),
+    /** Set when the discussions could not be read; the timeline is empty. */
+    timelineError: z.string().nullable(),
     files: z.array(
       z
         .object({
@@ -249,6 +332,94 @@ export const gitlabRpcContract = defineRpcContract({
     input: itemInputSchema,
     output: z.object({ mergeRequest: mergeRequestSchema }).strict(),
   },
+  getMergeRequestStatus: {
+    input: itemInputSchema,
+    output: mergeRequestStatusSchema,
+  },
+  setApproval: {
+    input: itemInputSchema
+      .extend({ approved: z.boolean(), sha: shaSchema })
+      .strict(),
+    output: okResultSchema,
+  },
+  mergeMergeRequest: {
+    input: itemInputSchema
+      .extend({
+        sha: shaSchema,
+        squash: z.boolean(),
+        removeSourceBranch: z.boolean(),
+        autoMerge: z.boolean(),
+      })
+      .strict(),
+    output: z.object({ state: z.string(), autoMerge: z.boolean() }).strict(),
+  },
+  cancelAutoMerge: { input: itemInputSchema, output: okResultSchema },
+  rebaseMergeRequest: { input: itemInputSchema, output: okResultSchema },
+  setMergeRequestPeople: {
+    input: itemInputSchema
+      .extend({
+        reviewers: z.array(z.string().min(1)).optional(),
+        assignees: z.array(z.string().min(1)).optional(),
+      })
+      .strict(),
+    output: z
+      .object({
+        ok: z.literal(true),
+        reviewers: z.array(z.string().min(1)),
+        assignees: z.array(z.string().min(1)),
+      })
+      .strict(),
+  },
+  runPipeline: { input: itemInputSchema, output: okResultSchema },
+  pipelineAction: {
+    input: z
+      .object({
+        project: projectRefSchema,
+        pipelineId: gitlabIdSchema,
+        action: z.enum(["retry", "cancel"]),
+      })
+      .strict(),
+    output: okResultSchema,
+  },
+  jobAction: {
+    input: z
+      .object({
+        project: projectRefSchema,
+        jobId: gitlabIdSchema,
+        action: z.enum(["play", "retry", "cancel"]),
+      })
+      .strict(),
+    output: okResultSchema,
+  },
+  replyToDiscussion: {
+    input: itemInputSchema
+      .extend({ discussionId: discussionIdSchema, body: nonBlankStringSchema })
+      .strict(),
+    output: okResultSchema,
+  },
+  setDiscussionResolved: {
+    input: itemInputSchema
+      .extend({ discussionId: discussionIdSchema, resolved: z.boolean() })
+      .strict(),
+    output: okResultSchema,
+  },
+  getDiffSnippet: {
+    input: z
+      .object({
+        project: projectRefSchema,
+        ref: shaSchema,
+        path: repoPathSchema,
+        line: z.number().int().positive(),
+        endLine: z.number().int().positive(),
+      })
+      .strict(),
+    output: z
+      .object({
+        startLine: z.number().int().positive(),
+        lines: z.array(z.string()),
+      })
+      .strict(),
+  },
   commentIssue: {
     input: itemInputSchema.extend({ body: nonBlankStringSchema }).strict(),
     output: okResultSchema,
@@ -322,6 +493,17 @@ const gitlabMergeRequestRowSchema = gitlabItemRowSchema.extend({
   has_conflicts: z.boolean().catch(false),
   detailed_merge_status: z.string().catch(""),
   merge_status: z.string().catch(""),
+  sha: z.string().catch(""),
+  squash: z.boolean().catch(false),
+  // Null when the author never chose; the project default applies then.
+  force_remove_source_branch: z.boolean().nullable().catch(null),
+  merge_when_pipeline_succeeds: z.boolean().catch(false),
+  merge_error: z.string().nullable().catch(null),
+  blocking_discussions_resolved: z.boolean().catch(true),
+  user: z
+    .looseObject({ can_merge: z.boolean().catch(false) })
+    .nullish()
+    .catch(null),
   head_pipeline: z
     .looseObject({
       id: z.number().int().nullable().catch(null),
@@ -331,12 +513,21 @@ const gitlabMergeRequestRowSchema = gitlabItemRowSchema.extend({
     .nullish()
     .catch(null),
 });
+const gitlabLineSchema = z
+  .looseObject({
+    new_line: z.number().int().nullable().catch(null),
+    old_line: z.number().int().nullable().catch(null),
+  })
+  .nullish()
+  .catch(null);
 const gitlabNoteRowSchema = z.looseObject({
+  id: z.number().int().nonnegative().catch(0),
   body: z.string().catch(""),
   system: z.boolean().catch(false),
   created_at: z.string().catch(""),
   resolvable: z.boolean().catch(false),
   resolved: z.boolean().catch(false),
+  resolved_by: gitlabUserRowSchema.nullish().catch(null),
   author: gitlabUserRowSchema.nullish().catch(null),
   position: z
     .looseObject({
@@ -344,13 +535,25 @@ const gitlabNoteRowSchema = z.looseObject({
       old_path: z.string().nullable().catch(null),
       new_line: z.number().int().nullable().catch(null),
       old_line: z.number().int().nullable().catch(null),
+      head_sha: z.string().nullable().catch(null),
+      base_sha: z.string().nullable().catch(null),
+      line_range: z
+        .looseObject({ start: gitlabLineSchema, end: gitlabLineSchema })
+        .nullish()
+        .catch(null),
     })
     .nullish()
     .catch(null),
 });
 const gitlabNoteListSchema = z.array(gitlabNoteRowSchema).catch([]);
 const gitlabDiscussionListSchema = z
-  .array(z.looseObject({ notes: gitlabNoteListSchema }))
+  .array(
+    z.looseObject({
+      id: z.string().catch(""),
+      individual_note: z.boolean().catch(false),
+      notes: gitlabNoteListSchema,
+    }),
+  )
   .catch([]);
 const gitlabDiffListSchema = z
   .array(
@@ -367,8 +570,11 @@ const gitlabDiffListSchema = z
 const gitlabJobListSchema = z
   .array(
     z.looseObject({
+      id: z.number().int().catch(0),
       name: z.string().catch("job"),
+      stage: z.string().catch(""),
       status: z.string().catch(""),
+      allow_failure: z.boolean().catch(false),
       web_url: z.string().catch(""),
     }),
   )
@@ -377,11 +583,32 @@ const gitlabApprovalsSchema = z
   .looseObject({
     approvals_required: z.number().int().nonnegative().catch(0),
     approvals_left: z.number().int().nonnegative().catch(0),
+    user_has_approved: z.boolean().catch(false),
+    user_can_approve: z.boolean().catch(false),
     approved_by: z
       .array(z.looseObject({ user: gitlabUserRowSchema.nullish().catch(null) }))
       .catch([]),
   })
-  .catch({ approvals_required: 0, approvals_left: 0, approved_by: [] });
+  .catch({
+    approvals_required: 0,
+    approvals_left: 0,
+    user_has_approved: false,
+    user_can_approve: false,
+    approved_by: [],
+  });
+const gitlabProjectSettingsSchema = z
+  .looseObject({
+    squash_option: z
+      .enum(["always", "never", "default_on", "default_off"])
+      .catch("default_off"),
+    remove_source_branch_after_merge: z.boolean().catch(false),
+  })
+  .catch({ squash_option: "default_off", remove_source_branch_after_merge: false });
+const gitlabRepositoryFileSchema = z.looseObject({
+  size: z.number().int().nonnegative().catch(0),
+  encoding: z.string().catch("base64"),
+  content: z.string().catch(""),
+});
 const gitlabMemberListSchema = z.array(gitlabUserRowSchema).catch([]);
 const gitlabLabelListSchema = z
   .array(z.looseObject({ name: z.string().catch("") }))
@@ -430,12 +657,24 @@ interface ThreadLink {
   createdAt: string;
 }
 
-/** Runs `glab api` against the host a project ref names, returning raw JSON. */
+/**
+ * Runs `glab api` against the host a project ref names, returning raw JSON
+ * (null for an empty response). `json` sends a JSON body instead of fields:
+ * the only way to send a real boolean or an empty id list.
+ */
 type GitlabApi = (
   project: string,
   endpoint: string,
-  options?: { method?: "POST" | "PUT"; fields?: Record<string, string> },
+  options?: {
+    method?: "POST" | "PUT";
+    fields?: Record<string, string>;
+    json?: Record<string, unknown>;
+  },
 ) => Promise<unknown>;
+
+type TimelineEntry = z.infer<typeof timelineEntrySchema>;
+type DiffPosition = z.infer<typeof diffPositionSchema>;
+type GitlabNotePosition = z.infer<typeof gitlabNoteRowSchema>["position"];
 
 function needsConfiguration(message: string): Error {
   return Object.assign(new Error(message), {
@@ -619,6 +858,134 @@ export function classifyJobStatus(
   }
 }
 
+/**
+ * A job's traffic light, where a failure the pipeline is allowed to ignore
+ * is a warning: GitLab still calls that pipeline "success".
+ */
+export function classifyJob(
+  rawStatus: string,
+  allowFailure: boolean,
+): "success" | "failure" | "warning" | "pending" | "neutral" {
+  const status = classifyJobStatus(rawStatus);
+  return status === "failure" && allowFailure ? "warning" : status;
+}
+
+/**
+ * Where an inline thread points. A removed line exists only on the old side,
+ * so its text is read from the base commit; every other line from the head.
+ * A multi-line comment keeps its range when both ends are on the same side.
+ */
+export function toDiffPosition(
+  position: GitlabNotePosition,
+): DiffPosition | null {
+  if (position == null) return null;
+  const side =
+    position.new_line == null && position.old_line != null ? "old" : "new";
+  const path =
+    (side === "old" ? position.old_path : position.new_path) ??
+    position.new_path ??
+    position.old_path ??
+    "";
+  if (path.length === 0) return null;
+  const pick = (
+    line: { new_line: number | null; old_line: number | null } | null | undefined,
+  ): number | null => {
+    const value = side === "old" ? line?.old_line : line?.new_line;
+    return value != null && value > 0 ? value : null;
+  };
+  const single = pick(position);
+  const start = pick(position.line_range?.start) ?? single;
+  const end = pick(position.line_range?.end) ?? single;
+  const line = start;
+  const endLine = line !== null && end !== null && end >= line ? end : line;
+  const ref = side === "old" ? position.base_sha : position.head_sha;
+  return {
+    path,
+    side,
+    line,
+    endLine,
+    ref: ref != null && ref.length > 0 ? ref : null,
+  };
+}
+
+/**
+ * GitLab's discussions → the timeline the panel shows. Each discussion is one
+ * entry, so a reply stays under the comment it answers. Pages are read in
+ * order, and the sort only guards that order; it is stable for equal times.
+ */
+export function toTimeline(raw: unknown): TimelineEntry[] {
+  const entries: TimelineEntry[] = [];
+  for (const discussion of gitlabDiscussionListSchema.parse(raw)) {
+    if (discussion.id.length === 0) continue;
+    const notes = discussion.notes
+      .filter((note) => note.body.trim().length > 0)
+      .map((note) => ({
+        id: note.id,
+        author: note.author?.username ?? "",
+        body: note.body,
+        createdAt: note.created_at,
+        system: note.system,
+      }));
+    if (notes.length === 0) continue;
+    const resolvableNotes = discussion.notes.filter((note) => note.resolvable);
+    const resolvable = resolvableNotes.length > 0;
+    const resolved =
+      resolvable && resolvableNotes.every((note) => note.resolved);
+    const resolvedBy = resolved
+      ? (resolvableNotes
+          .map((note) => note.resolved_by?.username ?? "")
+          .findLast((name) => name.length > 0) ?? null)
+      : null;
+    const kind = !discussion.individual_note
+      ? "thread"
+      : notes.every((note) => note.system)
+        ? "event"
+        : "comment";
+    entries.push({
+      id: discussion.id,
+      kind,
+      resolvable,
+      resolved,
+      resolvedBy,
+      position: toDiffPosition(
+        discussion.notes.find((note) => note.position != null)?.position ??
+          null,
+      ),
+      notes,
+    });
+  }
+  return entries
+    .map((entry, index) => ({ entry, index }))
+    .sort(
+      (a, b) =>
+        a.entry.notes[0].createdAt.localeCompare(b.entry.notes[0].createdAt) ||
+        a.index - b.index,
+    )
+    .map(({ entry }) => entry);
+}
+
+/**
+ * The lines an inline thread talks about, with a little code around them.
+ * Lines are 1-based. A range past the end of the file (the file changed
+ * since) is clamped rather than refused.
+ */
+export function sliceSnippet(
+  text: string,
+  line: number,
+  endLine: number,
+): { startLine: number; lines: string[] } {
+  const all = text.replace(/\r\n/g, "\n").split("\n");
+  if (all.length > 1 && all[all.length - 1] === "") all.pop();
+  const last = Math.min(Math.max(endLine, line), all.length);
+  const first = Math.max(1, Math.min(line, last) - SNIPPET_CONTEXT_BEFORE);
+  const stop = Math.min(
+    all.length,
+    last + SNIPPET_CONTEXT_AFTER,
+    first + MAX_SNIPPET_LINES - 1,
+  );
+  return { startLine: first, lines: all.slice(first - 1, stop) };
+}
+
 export function validateGitlabCliArgs(argv: string[]): string | null {
   const [sub, arg, ...rest] = argv;
   if (rest.length > 0) return `Unexpected argument "${rest[0]}".`;
@@ -730,22 +1097,28 @@ function run(
   file: string,
   args: string[],
   timeoutMs = 30_000,
+  input?: string,
 ): Promise<{ stdout: string; stderr: string }> {
   const { promise, resolve, reject } = Promise.withResolvers<{
     stdout: string;
     stderr: string;
   }>();
-  execFile(
+  const child = execFile(
     file,
     args,
     { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
     (error, stdout, stderr) => {
       if (error) {
+        // `glab api` prints GitLab's error body on stdout; keep it for callers
+        // that can turn it into a readable message.
         reject(
-          new Error(
-            `${file} ${args.slice(0, 3).join(" ")} failed: ${
-              stderr.trim() || error.message
-            }`,
+          Object.assign(
+            new Error(
+              `${file} ${args.slice(0, 3).join(" ")} failed: ${
+                stderr.trim() || error.message
+              }`,
+            ),
+            { stdout, stderr },
           ),
         );
       } else {
@@ -753,7 +1126,39 @@ function run(
       }
     },
   );
+  if (input !== undefined) child.stdin?.end(input);
   return promise;
+}
+
+/**
+ * GitLab's own explanation from an error body — `{"message": …}` (a string, a
+ * list, or a field → list map) or `{"error": "…"}` — or null when the body
+ * says nothing readable.
+ */
+export function gitlabErrorMessage(body: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const record = parsed as Record<string, unknown>;
+  const flatten = (value: unknown): string[] => {
+    if (typeof value === "string") return [value];
+    if (Array.isArray(value)) return value.flatMap(flatten);
+    if (typeof value === "object" && value !== null) {
+      return Object.entries(value).flatMap(([key, inner]) =>
+        flatten(inner).map((text) => `${key} ${text}`),
+      );
+    }
+    return [];
+  };
+  const text = [...flatten(record.message), ...flatten(record.error)]
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .join("; ");
+  return text.length > 0 ? text : null;
 }
 
 export default async function plugin(bb: BbPluginApi) {
@@ -808,9 +1213,13 @@ export default async function plugin(bb: BbPluginApi) {
     throw needsConfiguration(`GitLab CLI not found. ${GLAB_HINT}`);
   }
 
-  async function glab(args: string[], timeoutMs?: number): Promise<string> {
+  async function glab(
+    args: string[],
+    timeoutMs?: number,
+    input?: string,
+  ): Promise<string> {
     const file = await resolveGlab();
-    const { stdout } = await run(file, args, timeoutMs);
+    const { stdout } = await run(file, args, timeoutMs, input);
     return stdout;
   }
 
@@ -826,9 +1235,47 @@ export default async function plugin(bb: BbPluginApi) {
     for (const [key, value] of Object.entries(options?.fields ?? {})) {
       args.push("--raw-field", `${key}=${value}`);
     }
+    let input: string | undefined;
+    if (options?.json !== undefined) {
+      args.push("--header", "Content-Type: application/json", "--input", "-");
+      input = JSON.stringify(options.json);
+    }
     args.push(endpoint);
-    return JSON.parse(await glab(args, 30_000)) as unknown;
+    let stdout: string;
+    try {
+      stdout = await glab(args, 30_000, input);
+    } catch (error) {
+      // Prefer GitLab's reason ("Branch cannot be merged") over glab's bare
+      // "HTTP 405", keeping the status code that callers match on.
+      const body = (error as { stdout?: unknown }).stdout;
+      const reason =
+        typeof body === "string" ? gitlabErrorMessage(body) : null;
+      if (reason === null) throw error;
+      const code = String(error).match(/HTTP (\d{3})/)?.[1];
+      throw new Error(code === undefined ? reason : `${reason} (HTTP ${code})`);
+    }
+    return stdout.trim().length === 0 ? null : (JSON.parse(stdout) as unknown);
   };
+
+  /** Every page of a list endpoint, up to `maxPages` pages of 100. */
+  async function gitlabApiPages(
+    project: string,
+    endpoint: string,
+    maxPages: number,
+  ): Promise<unknown[]> {
+    const rows: unknown[] = [];
+    const separator = endpoint.includes("?") ? "&" : "?";
+    for (let page = 1; page <= maxPages; page++) {
+      const batch = await gitlabApi(
+        project,
+        `${endpoint}${separator}per_page=100&page=${page}`,
+      );
+      if (!Array.isArray(batch)) break;
+      rows.push(...(batch as unknown[]));
+      if (batch.length < 100) break;
+    }
+    return rows;
+  }
 
   /**
    * How this instance is reached, straight from its glab config. Unset keys
@@ -1065,7 +1512,12 @@ export default async function plugin(bb: BbPluginApi) {
     kind: "issue" | "mr",
     project: string,
     iid: number,
-    patch: { state?: string; assignees?: string[]; labels?: string[] },
+    patch: {
+      state?: string;
+      assignees?: string[];
+      reviewers?: string[];
+      labels?: string[];
+    },
   ): void {
     if (patch.state !== undefined) {
       db.prepare(
@@ -1076,6 +1528,11 @@ export default async function plugin(bb: BbPluginApi) {
       db.prepare(
         "UPDATE items SET assignees = ? WHERE project = ? AND kind = ? AND iid = ?",
       ).run(JSON.stringify(patch.assignees), project, kind, iid);
+    }
+    if (patch.reviewers !== undefined) {
+      db.prepare(
+        "UPDATE items SET reviewers = ? WHERE project = ? AND kind = ? AND iid = ?",
+      ).run(JSON.stringify(patch.reviewers), project, kind, iid);
     }
     if (patch.labels !== undefined) {
       db.prepare(
@@ -1355,6 +1812,148 @@ export default async function plugin(bb: BbPluginApi) {
     return labels;
   }
 
+  // ------------------------------------------------------------------
+  // Merge-request helpers shared by the detail view and its live status.
+  // ------------------------------------------------------------------
+  const projectSettingsCache = new Map<
+    string,
+    {
+      settings: z.infer<typeof gitlabProjectSettingsSchema>;
+      fetchedAt: number;
+    }
+  >();
+
+  /** The project's squash and delete-branch defaults, for the merge widget. */
+  async function getProjectSettings(
+    project: string,
+  ): Promise<z.infer<typeof gitlabProjectSettingsSchema>> {
+    const cached = projectSettingsCache.get(project);
+    if (cached !== undefined && Date.now() - cached.fetchedAt < 10 * 60_000) {
+      return cached.settings;
+    }
+    const { path } = parseProjectRef(project);
+    let raw: unknown;
+    try {
+      raw = await gitlabApi(project, `projects/${encodeURIComponent(path)}`);
+    } catch (error) {
+      bb.log.warn(
+        `project settings for ${project} failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const settings = gitlabProjectSettingsSchema.parse(raw);
+    if (raw !== undefined) {
+      projectSettingsCache.set(project, { settings, fetchedAt: Date.now() });
+    }
+    return settings;
+  }
+
+  /** A pipeline's latest jobs. Jobs are optional: a failure shows none. */
+  async function loadJobs(
+    project: string,
+    pipelineId: number | null,
+  ): Promise<z.infer<typeof jobSchema>[]> {
+    if (pipelineId === null) return [];
+    const { path } = parseProjectRef(project);
+    let raw: unknown;
+    try {
+      raw = await gitlabApi(
+        project,
+        `projects/${encodeURIComponent(path)}/pipelines/${pipelineId}/jobs?per_page=100`,
+      );
+    } catch (error) {
+      bb.log.warn(
+        `jobs of pipeline ${pipelineId} failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return [];
+    }
+    return gitlabJobListSchema
+      .parse(raw)
+      .filter((job) => job.id > 0)
+      .map((job) => ({
+        id: job.id,
+        name: job.name,
+        stage: job.stage,
+        status: classifyJob(job.status, job.allow_failure),
+        rawStatus: job.status,
+        url: job.web_url,
+      }));
+  }
+
+  /** The moving parts of a merge request, from its detail row. */
+  async function toMergeRequestStatus(
+    project: string,
+    detail: z.infer<typeof gitlabMergeRequestRowSchema>,
+  ): Promise<z.infer<typeof mergeRequestStatusSchema>> {
+    const pipeline =
+      detail.head_pipeline?.id != null && detail.head_pipeline.id > 0
+        ? {
+            id: detail.head_pipeline.id,
+            status: detail.head_pipeline.status,
+            url: detail.head_pipeline.web_url,
+          }
+        : null;
+    return {
+      state: detail.state,
+      draft: detail.draft || detail.work_in_progress,
+      sha: detail.sha,
+      mergeStatus: detail.detailed_merge_status || detail.merge_status,
+      hasConflicts: detail.has_conflicts,
+      autoMerge: detail.merge_when_pipeline_succeeds,
+      pipeline,
+      jobs: await loadJobs(project, pipeline?.id ?? null),
+    };
+  }
+
+  /** "projects/<id>/merge_requests/<iid>" for a project ref. */
+  function mergeRequestPath(project: string, iid: number): string {
+    const { path } = parseProjectRef(project);
+    return `projects/${encodeURIComponent(path)}/merge_requests/${iid}`;
+  }
+
+  // File text at a commit, for inline-thread snippets. A commit's copy of a
+  // file never changes, so a small most-recent-first cache is safe.
+  const fileTextCache = new Map<string, string>();
+  const FILE_TEXT_CACHE_SIZE = 30;
+
+  async function fileTextAt(
+    project: string,
+    ref: string,
+    filePath: string,
+  ): Promise<string> {
+    const key = `${project}@${ref}:${filePath}`;
+    const cached = fileTextCache.get(key);
+    if (cached !== undefined) {
+      fileTextCache.delete(key);
+      fileTextCache.set(key, cached);
+      return cached;
+    }
+    const { path } = parseProjectRef(project);
+    const file = gitlabRepositoryFileSchema.parse(
+      await gitlabApi(
+        project,
+        `projects/${encodeURIComponent(path)}/repository/files/${encodeURIComponent(filePath)}?ref=${ref}`,
+      ),
+    );
+    if (file.size > MAX_SNIPPET_FILE_BYTES) {
+      throw new Error("The file is too large to show here.");
+    }
+    const text =
+      file.encoding === "base64"
+        ? Buffer.from(file.content, "base64").toString("utf8")
+        : file.content;
+    fileTextCache.set(key, text);
+    while (fileTextCache.size > FILE_TEXT_CACHE_SIZE) {
+      const oldest = fileTextCache.keys().next().value;
+      if (oldest === undefined) break;
+      fileTextCache.delete(oldest);
+    }
+    return text;
+  }
+
   /** Human notes of a GitLab note list — GitLab's activity feed is in there too. */
   function toNotes(raw: unknown): Note[] {
     return gitlabNoteListSchema
@@ -1614,16 +2213,14 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     /**
-     * { project, iid } → full merge-request detail: overview, pipeline jobs
-     * (GitLab's answer to checks), approvals, conversation notes, inline
-     * discussion threads, and per-file diffs. Approvals, discussions, diffs,
-     * and jobs are optional on any given instance or plan, so a failure there
-     * degrades that section instead of the whole view.
+     * { project, iid } → full merge-request detail: overview, pipeline and
+     * jobs (GitLab's answer to checks), approvals, merge defaults, the
+     * activity timeline, and per-file diffs. Approvals, diffs, jobs, and the
+     * project's settings are optional on any given instance or plan, so a
+     * failure there degrades that section instead of the whole view.
      */
     async getMergeRequest({ project, iid }) {
-      const { path } = parseProjectRef(project);
-      const encoded = encodeURIComponent(path);
-      const base = `projects/${encoded}/merge_requests/${iid}`;
+      const base = mergeRequestPath(project, iid);
       const optional = async (endpoint: string): Promise<unknown> => {
         try {
           return await gitlabApi(project, endpoint);
@@ -1636,67 +2233,29 @@ export default async function plugin(bb: BbPluginApi) {
           return undefined;
         }
       };
-      const [detailRaw, notesRaw, discussionsRaw, diffsRaw, approvalsRaw] =
+      // The timeline is the conversation itself, so a failure is reported
+      // in the view rather than passed off as "no comments yet".
+      const timelineRead = gitlabApiPages(
+        project,
+        `${base}/discussions`,
+        DISCUSSION_PAGES,
+      ).then(
+        (rows) => ({ timeline: toTimeline(rows), timelineError: null }),
+        (error: unknown) => ({
+          timeline: [],
+          timelineError: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      const [detailRaw, diffsRaw, approvalsRaw, settings, timelineResult] =
         await Promise.all([
           gitlabApi(project, base),
-          gitlabApi(
-            project,
-            `${base}/notes?per_page=100&sort=asc&order_by=created_at`,
-          ),
-          optional(`${base}/discussions?per_page=100`),
           optional(`${base}/diffs?per_page=${DIFF_PAGE}`),
           optional(`${base}/approvals`),
+          getProjectSettings(project),
+          timelineRead,
         ]);
       const detail = gitlabMergeRequestRowSchema.parse(detailRaw);
-
-      const pipelineId = detail.head_pipeline?.id ?? null;
-      const jobs = gitlabJobListSchema
-        .parse(
-          pipelineId === null
-            ? []
-            : await optional(
-                `projects/${encoded}/pipelines/${pipelineId}/jobs?per_page=100`,
-              ),
-        )
-        .map((job) => ({
-          name: job.name,
-          status: classifyJobStatus(job.status),
-          rawStatus: job.status,
-          url: job.web_url,
-        }));
-
-      // A discussion whose notes carry a diff position is an inline review
-      // thread; everything else already showed up in the conversation notes.
-      const discussions: Array<{
-        path: string;
-        line: number | null;
-        resolved: boolean;
-        notes: Note[];
-      }> = [];
-      for (const discussion of gitlabDiscussionListSchema.parse(
-        discussionsRaw,
-      )) {
-        const position = discussion.notes.find(
-          (note) => note.position != null,
-        )?.position;
-        if (position == null) continue;
-        const notes = discussion.notes
-          .filter((note) => !note.system && note.body.trim().length > 0)
-          .map((note) => ({
-            author: note.author?.username ?? "",
-            body: note.body,
-            createdAt: note.created_at,
-          }));
-        if (notes.length === 0) continue;
-        discussions.push({
-          path: position.new_path ?? position.old_path ?? "",
-          line: position.new_line ?? position.old_line,
-          resolved: discussion.notes.every(
-            (note) => !note.resolvable || note.resolved,
-          ),
-          notes,
-        });
-      }
+      const status = await toMergeRequestStatus(project, detail);
 
       let additions = 0;
       let deletions = 0;
@@ -1729,13 +2288,21 @@ export default async function plugin(bb: BbPluginApi) {
         ? changesCount
         : files.length;
 
+      // "always" and "never" decide for everyone; otherwise the choice saved
+      // on the merge request stands, as it does in GitLab's merge widget.
+      const squash =
+        settings.squash_option === "always"
+          ? true
+          : settings.squash_option === "never"
+            ? false
+            : detail.squash;
+
       return {
         mergeRequest: {
+          ...status,
           project,
           iid,
           title: detail.title,
-          state: detail.state,
-          draft: detail.draft || detail.work_in_progress,
           author: detail.author?.username ?? "",
           body: detail.description,
           url: detail.web_url,
@@ -1753,26 +2320,218 @@ export default async function plugin(bb: BbPluginApi) {
           labels: detail.labels,
           assignees: usernames(detail.assignees),
           reviewers: usernames(detail.reviewers),
-          mergeStatus: detail.detailed_merge_status || detail.merge_status,
-          hasConflicts: detail.has_conflicts,
           approvalsRequired: approvals.approvals_required,
           approvalsLeft: approvals.approvals_left,
           approvedBy: approvals.approved_by
             .map((entry) => entry.user?.username ?? "")
             .filter((name) => name.length > 0),
-          pipeline:
-            detail.head_pipeline == null
-              ? null
-              : {
-                  status: detail.head_pipeline.status,
-                  url: detail.head_pipeline.web_url,
-                },
-          jobs,
-          notes: toNotes(notesRaw),
-          discussions,
+          userHasApproved: approvals.user_has_approved,
+          userCanApprove: approvals.user_can_approve,
+          canMerge: detail.user?.can_merge ?? false,
+          squash,
+          squashOption: settings.squash_option,
+          removeSourceBranch:
+            detail.force_remove_source_branch ??
+            settings.remove_source_branch_after_merge,
+          mergeError:
+            detail.merge_error !== null && detail.merge_error.trim().length > 0
+              ? detail.merge_error
+              : null,
+          blockingDiscussionsResolved: detail.blocking_discussions_resolved,
+          ...timelineResult,
           files,
         },
       };
+    },
+
+    /**
+     * { project, iid } → the parts that move while a merge request is open:
+     * state, merge status, pipeline, jobs. Two API calls, cheap enough for
+     * the panel to poll while a pipeline runs.
+     */
+    async getMergeRequestStatus({ project, iid }) {
+      const detail = gitlabMergeRequestRowSchema.parse(
+        await gitlabApi(project, mergeRequestPath(project, iid)),
+      );
+      return await toMergeRequestStatus(project, detail);
+    },
+
+    /**
+     * { project, iid, approved, sha } → approve or revoke the viewer's
+     * approval. The sha makes GitLab refuse when new commits arrived since
+     * the viewer looked.
+     */
+    async setApproval({ project, iid, approved, sha }): Promise<{ ok: true }> {
+      const base = mergeRequestPath(project, iid);
+      await gitlabApi(
+        project,
+        approved ? `${base}/approve` : `${base}/unapprove`,
+        approved ? { method: "POST", json: { sha } } : { method: "POST" },
+      );
+      return { ok: true };
+    },
+
+    /**
+     * { project, iid, sha, squash, removeSourceBranch, autoMerge } → merge
+     * now, or set it to merge when the pipeline succeeds. GitLab refuses when
+     * the head is no longer `sha`, so the viewer merges what they saw.
+     */
+    async mergeMergeRequest({
+      project,
+      iid,
+      sha,
+      squash,
+      removeSourceBranch,
+      autoMerge,
+    }) {
+      const updated = gitlabMergeRequestRowSchema.parse(
+        await gitlabApi(project, `${mergeRequestPath(project, iid)}/merge`, {
+          method: "PUT",
+          json: {
+            sha,
+            squash,
+            should_remove_source_branch: removeSourceBranch,
+            ...(autoMerge ? { auto_merge: true } : {}),
+          },
+        }),
+      );
+      if (updated.state === "merged") {
+        patchCachedItem("mr", project, iid, { state: "merged" });
+      }
+      return {
+        state: updated.state,
+        autoMerge: updated.merge_when_pipeline_succeeds,
+      };
+    },
+
+    /** { project, iid } → drop "merge when the pipeline succeeds". */
+    async cancelAutoMerge({ project, iid }): Promise<{ ok: true }> {
+      await gitlabApi(
+        project,
+        `${mergeRequestPath(project, iid)}/cancel_merge_when_pipeline_succeeds`,
+        { method: "POST" },
+      );
+      return { ok: true };
+    },
+
+    /**
+     * { project, iid } → rebase the source branch onto the target. GitLab
+     * does it in the background; the merge status reads "checking" meanwhile.
+     */
+    async rebaseMergeRequest({ project, iid }): Promise<{ ok: true }> {
+      await gitlabApi(project, `${mergeRequestPath(project, iid)}/rebase`, {
+        method: "PUT",
+      });
+      return { ok: true };
+    },
+
+    /**
+     * { project, iid, reviewers?, assignees? } → set the exact reviewer and/or
+     * assignee lists; a list left out is not touched. GitLab reads [0] as
+     * "nobody".
+     */
+    async setMergeRequestPeople({
+      project,
+      iid,
+      reviewers,
+      assignees,
+    }): Promise<{ ok: true; reviewers: string[]; assignees: string[] }> {
+      const json: Record<string, unknown> = {};
+      if (reviewers !== undefined) {
+        const ids = await resolveUserIds(project, [...new Set(reviewers)]);
+        json.reviewer_ids = ids.length > 0 ? ids : [0];
+      }
+      if (assignees !== undefined) {
+        const ids = await resolveUserIds(project, [...new Set(assignees)]);
+        json.assignee_ids = ids.length > 0 ? ids : [0];
+      }
+      const updated = gitlabMergeRequestRowSchema.parse(
+        await gitlabApi(project, mergeRequestPath(project, iid), {
+          method: "PUT",
+          json,
+        }),
+      );
+      const applied = {
+        reviewers: usernames(updated.reviewers),
+        assignees: usernames(updated.assignees),
+      };
+      patchCachedItem("mr", project, iid, applied);
+      return { ok: true, ...applied };
+    },
+
+    /**
+     * { project, iid } → start a new merge-request pipeline, the same one
+     * GitLab's "Run pipeline" button starts.
+     */
+    async runPipeline({ project, iid }): Promise<{ ok: true }> {
+      await gitlabApi(project, `${mergeRequestPath(project, iid)}/pipelines`, {
+        method: "POST",
+      });
+      return { ok: true };
+    },
+
+    /** { project, pipelineId, action } → retry failed jobs, or cancel. */
+    async pipelineAction({ project, pipelineId, action }): Promise<{ ok: true }> {
+      const { path } = parseProjectRef(project);
+      await gitlabApi(
+        project,
+        `projects/${encodeURIComponent(path)}/pipelines/${pipelineId}/${action}`,
+        { method: "POST" },
+      );
+      return { ok: true };
+    },
+
+    /** { project, jobId, action } → start a manual job, retry, or cancel. */
+    async jobAction({ project, jobId, action }): Promise<{ ok: true }> {
+      const { path } = parseProjectRef(project);
+      await gitlabApi(
+        project,
+        `projects/${encodeURIComponent(path)}/jobs/${jobId}/${action}`,
+        { method: "POST" },
+      );
+      return { ok: true };
+    },
+
+    /**
+     * { project, iid, discussionId, body } → reply inside a thread. Replying
+     * to a single comment turns it into a thread, as it does on GitLab.
+     */
+    async replyToDiscussion({
+      project,
+      iid,
+      discussionId,
+      body,
+    }): Promise<{ ok: true }> {
+      await gitlabApi(
+        project,
+        `${mergeRequestPath(project, iid)}/discussions/${discussionId}/notes`,
+        { method: "POST", json: { body } },
+      );
+      return { ok: true };
+    },
+
+    /** { project, iid, discussionId, resolved } → resolve or reopen a thread. */
+    async setDiscussionResolved({
+      project,
+      iid,
+      discussionId,
+      resolved,
+    }): Promise<{ ok: true }> {
+      await gitlabApi(
+        project,
+        `${mergeRequestPath(project, iid)}/discussions/${discussionId}`,
+        { method: "PUT", json: { resolved } },
+      );
+      return { ok: true };
+    },
+
+    /**
+     * { project, ref, path, line, endLine } → the lines an inline thread is
+     * about, read from the commit it was written against, so the code still
+     * matches the comment after later pushes.
+     */
+    async getDiffSnippet({ project, ref, path, line, endLine }) {
+      return sliceSnippet(await fileTextAt(project, ref, path), line, endLine);
     },
 
     /** { project, iid, body } → add an issue comment. */

@@ -3,9 +3,11 @@ import { defineRpcContract } from "@get-bb/plugin-sdk";
 import type { PluginRpcClient, PluginRpcHandlers } from "@get-bb/plugin-sdk";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import {
+  classifyJob,
   classifyJobStatus,
   countDiffLines,
   fetchProjectItems,
+  gitlabErrorMessage,
   gitlabRpcContract,
   isProjectRef,
   normalizeHostname,
@@ -13,7 +15,10 @@ import {
   parseAuthenticatedHosts,
   parseGitlabRemote,
   parseProjectRef,
+  sliceSnippet,
+  toDiffPosition,
   toItems,
+  toTimeline,
   validateGitlabCliArgs,
   type GitlabHost,
 } from "./server";
@@ -190,6 +195,32 @@ describe("glab plumbing", () => {
     expect(classifyJobStatus("skipped")).toBe("neutral");
   });
 
+  it("shows a failure the pipeline may ignore as a warning, not red", () => {
+    // GitLab calls such a pipeline "success"; red jobs would contradict it.
+    expect(classifyJob("failed", true)).toBe("warning");
+    expect(classifyJob("failed", false)).toBe("failure");
+    expect(classifyJob("success", true)).toBe("success");
+    expect(classifyJob("running", true)).toBe("pending");
+  });
+
+  it("reads GitLab's reason out of an error body", () => {
+    expect(gitlabErrorMessage('{"message":"404 Not found"}')).toBe(
+      "404 Not found",
+    );
+    expect(gitlabErrorMessage('{"error":"text is missing"}')).toBe(
+      "text is missing",
+    );
+    expect(
+      gitlabErrorMessage(
+        '{"message":{"base":["Branch cannot be merged"],"sha":["is stale"]}}',
+      ),
+    ).toBe("base Branch cannot be merged; sha is stale");
+    expect(gitlabErrorMessage('{"message":["one","two"]}')).toBe("one; two");
+    expect(gitlabErrorMessage("")).toBeNull();
+    expect(gitlabErrorMessage("<html>502</html>")).toBeNull();
+    expect(gitlabErrorMessage('{"id":1}')).toBeNull();
+  });
+
   it("rejects CLI arguments that would otherwise broaden a project query", () => {
     expect(validateGitlabCliArgs(["issues", "gitlab.com/group/sub/app"])).toBeNull();
     expect(validateGitlabCliArgs(["issues", "not a project"])).toContain(
@@ -306,6 +337,222 @@ describe("GitLab payload parsing", () => {
   });
 });
 
+describe("merge-request timeline", () => {
+  const user = (username: string) => ({ id: 1, username });
+  const note = (fields: Record<string, unknown>) => ({
+    id: 1,
+    body: "text",
+    system: false,
+    resolvable: false,
+    resolved: false,
+    created_at: "2026-09-20T10:00:00.000Z",
+    author: user("dana"),
+    ...fields,
+  });
+  const diffPosition = {
+    new_path: "src/app.ts",
+    old_path: "src/app.ts",
+    new_line: 12,
+    old_line: null,
+    head_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+    line_range: null,
+  };
+
+  it("keeps replies under the comment they answer", () => {
+    const timeline = toTimeline([
+      {
+        id: "d1",
+        individual_note: true,
+        notes: [
+          note({ id: 10, system: true, body: "requested review from @kai" }),
+        ],
+      },
+      {
+        id: "d2",
+        individual_note: true,
+        notes: [note({ id: 11, body: "Looks fine overall." })],
+      },
+      {
+        id: "d3",
+        individual_note: false,
+        notes: [
+          note({
+            id: 12,
+            body: "Why is this mocked?",
+            resolvable: true,
+            resolved: true,
+            resolved_by: user("sam"),
+            position: diffPosition,
+          }),
+          note({
+            id: 13,
+            system: true,
+            body: "changed this line in [version 2 of the diff](/x)",
+            position: diffPosition,
+          }),
+          note({
+            id: 14,
+            author: user("sam"),
+            body: "Removed it.",
+            resolvable: true,
+            resolved: true,
+            position: diffPosition,
+          }),
+        ],
+      },
+    ]);
+
+    expect(timeline.map((entry) => entry.kind)).toEqual([
+      "event",
+      "comment",
+      "thread",
+    ]);
+    const thread = timeline[2];
+    expect(thread.id).toBe("d3");
+    expect(thread.notes.map((entry) => entry.id)).toEqual([12, 13, 14]);
+    expect(thread.notes[1].system).toBe(true);
+    expect(thread).toMatchObject({
+      resolvable: true,
+      resolved: true,
+      resolvedBy: "sam",
+      position: {
+        path: "src/app.ts",
+        side: "new",
+        line: 12,
+        endLine: 12,
+        ref: "a".repeat(40),
+      },
+    });
+  });
+
+  it("marks a thread unresolved while any resolvable note is open", () => {
+    const [thread] = toTimeline([
+      {
+        id: "d1",
+        individual_note: false,
+        notes: [
+          note({ id: 1, resolvable: true, resolved: true }),
+          note({ id: 2, resolvable: true, resolved: false }),
+        ],
+      },
+    ]);
+    expect(thread).toMatchObject({
+      kind: "thread",
+      resolvable: true,
+      resolved: false,
+      resolvedBy: null,
+      position: null,
+    });
+  });
+
+  it("drops blank notes, empty discussions, and rows with no id", () => {
+    const timeline = toTimeline([
+      { id: "", individual_note: true, notes: [note({ id: 1 })] },
+      { id: "d2", individual_note: true, notes: [note({ id: 2, body: "  " })] },
+      {
+        id: "d3",
+        individual_note: false,
+        notes: [note({ id: 3, body: "" }), note({ id: 4, body: "kept" })],
+      },
+    ]);
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0].notes.map((entry) => entry.id)).toEqual([4]);
+    expect(toTimeline("not a list")).toEqual([]);
+  });
+
+  it("keeps GitLab's order, sorting only by the first note's time", () => {
+    const timeline = toTimeline([
+      {
+        id: "late",
+        individual_note: true,
+        notes: [note({ created_at: "2026-09-21T00:00:00.000Z" })],
+      },
+      {
+        id: "early",
+        individual_note: true,
+        notes: [note({ created_at: "2026-09-20T00:00:00.000Z" })],
+      },
+      {
+        id: "early-2",
+        individual_note: true,
+        notes: [note({ created_at: "2026-09-20T00:00:00.000Z" })],
+      },
+    ]);
+    expect(timeline.map((entry) => entry.id)).toEqual([
+      "early",
+      "early-2",
+      "late",
+    ]);
+  });
+
+  it("reads a removed line from the base commit", () => {
+    expect(
+      toDiffPosition({
+        ...diffPosition,
+        new_path: "src/renamed.ts",
+        old_path: "src/app.ts",
+        new_line: null,
+        old_line: 30,
+      }),
+    ).toEqual({
+      path: "src/app.ts",
+      side: "old",
+      line: 30,
+      endLine: 30,
+      ref: "b".repeat(40),
+    });
+  });
+
+  it("keeps the range of a multi-line comment", () => {
+    expect(
+      toDiffPosition({
+        ...diffPosition,
+        new_line: 15,
+        line_range: {
+          start: { new_line: 11, old_line: null },
+          end: { new_line: 15, old_line: null },
+        },
+      }),
+    ).toMatchObject({ line: 11, endLine: 15 });
+  });
+
+  it("has no lines for a comment on a whole file", () => {
+    expect(
+      toDiffPosition({ ...diffPosition, new_line: null, old_line: null }),
+    ).toEqual({
+      path: "src/app.ts",
+      side: "new",
+      line: null,
+      endLine: null,
+      ref: "a".repeat(40),
+    });
+    expect(toDiffPosition(null)).toBeNull();
+  });
+
+  it("cuts the thread's lines out of a file, with a little context", () => {
+    const text = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join(
+      "\n",
+    );
+    expect(sliceSnippet(text, 10, 10)).toEqual({
+      startLine: 7,
+      lines: ["line 7", "line 8", "line 9", "line 10", "line 11", "line 12"],
+    });
+    // Near the top and bottom the context shrinks instead of going out of range.
+    expect(sliceSnippet(text, 1, 1).startLine).toBe(1);
+    expect(sliceSnippet(text, 20, 20).lines.at(-1)).toBe("line 20");
+    // A line past the end (the file changed since) is clamped, not refused.
+    expect(sliceSnippet(text, 99, 99).lines.at(-1)).toBe("line 20");
+    // A trailing newline is not an extra empty line.
+    expect(sliceSnippet("a\nb\n", 2, 2).lines).toEqual(["a", "b"]);
+  });
+
+  it("caps a very long range", () => {
+    const text = Array.from({ length: 500 }, (_, i) => `${i + 1}`).join("\n");
+    expect(sliceSnippet(text, 10, 400).lines).toHaveLength(40);
+  });
+});
+
 describe("rpc contract", () => {
   it("infers parsed handler inputs and frontend results", () => {
     expectTypeOf<
@@ -346,5 +593,70 @@ describe("rpc contract", () => {
         iid: 4,
       }),
     ).rejects.toMatchObject({ code: "invalid_output" });
+  });
+
+  it("refuses ids that could change the GitLab URL they are put in", async () => {
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "gitlab-contract-ids",
+    });
+    const contract = defineRpcContract({
+      replyToDiscussion: gitlabRpcContract.replyToDiscussion,
+      setApproval: gitlabRpcContract.setApproval,
+      getDiffSnippet: gitlabRpcContract.getDiffSnippet,
+      jobAction: gitlabRpcContract.jobAction,
+    });
+    bb.rpc.register(contract, {
+      replyToDiscussion: () => ({ ok: true as const }),
+      setApproval: () => ({ ok: true as const }),
+      getDiffSnippet: () => ({ startLine: 1, lines: [] }),
+      jobAction: () => ({ ok: true as const }),
+    });
+    const project = "gitlab.com/group/app";
+
+    await expect(
+      harness.callRpc("replyToDiscussion", {
+        project,
+        iid: 4,
+        discussionId: "../../../projects",
+        body: "hi",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(
+      harness.callRpc("replyToDiscussion", {
+        project,
+        iid: 4,
+        discussionId: "a1b2c3d4e5",
+        body: "   ",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(
+      harness.callRpc("setApproval", {
+        project,
+        iid: 4,
+        approved: true,
+        sha: "main",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(
+      harness.callRpc("getDiffSnippet", {
+        project,
+        ref: "a".repeat(40),
+        path: "/etc/passwd",
+        line: 1,
+        endLine: 1,
+      }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(
+      harness.callRpc("jobAction", { project, jobId: 7, action: "erase" }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+
+    await expect(
+      harness.callRpc("replyToDiscussion", {
+        project,
+        iid: 4,
+        discussionId: "a1b2c3d4e5",
+        body: "Thanks!",
+      }),
+    ).resolves.toEqual({ ok: true });
   });
 });

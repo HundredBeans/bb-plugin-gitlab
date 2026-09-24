@@ -34,11 +34,32 @@ thread links survive it.
 - **Issue detail**: markdown description, notes, comment box, state, assignee
   and label editing, plus "Send agent". Deep-linkable through the URL hash:
   `#/issues/<host>/<namespace/path>/<iid>`.
-- **Merge-request detail**: source → target branch, mergeability, pipeline jobs,
-  approvals, reviewers, conversation notes, inline discussion threads, and
-  per-file diffs rendered by the same syntax-highlighting engine as the rest of
-  BB, following the host's code theme. Deep-linkable as
-  `#/merge_requests/<host>/<namespace/path>/<iid>`.
+- **Merge-request detail**: source → target branch, labels, and per-file diffs
+  rendered by the same syntax-highlighting engine as the rest of BB, following
+  the host's code theme. Deep-linkable as
+  `#/merge_requests/<host>/<namespace/path>/<iid>`. On top of that:
+  - **Merge box** — approve or revoke your approval; the pipeline with its jobs
+    by stage, "Run pipeline", "Retry failed", "Cancel", and per-job run
+    (manual), retry, or cancel; merge with the squash and delete-branch
+    options pre-filled from GitLab, behind a confirmation, or "Set to
+    auto-merge" while a pipeline runs; "Rebase" when GitLab asks for one.
+    GitLab's merge status is spelled out ("All threads must be resolved
+    first"). Merge and approve send the commit you saw, so GitLab refuses if
+    new commits arrived meanwhile. A job that is allowed to fail shows as a
+    warning, not red.
+  - **Reviewers and assignees** — editable, also in the thread side panel.
+  - **Activity** — GitLab's discussions as one timeline: events ("approved",
+    "added 1 commit") as single lines, comments as cards, and threads with
+    their replies grouped under them. An inline thread shows the file, the
+    line, and the code it is about, read from the commit it was written
+    against. Reply to any comment or thread, resolve or reopen threads, and
+    filter by All / Comments / Unresolved. Resolved threads start folded.
+  - **Live status** — while a pipeline runs, while GitLab re-checks
+    mergeability, and for a minute after any action, the view polls a cheap
+    status read every 10 seconds (never while the page is hidden).
+- **Thread side panel** ("Merge request" in a thread's right panel): the same
+  merge-request view, single column, resolved to the thread's own merge
+  request through its branch.
 - **Send agent / Review with agent**: spawns a BB worker thread on the issue (or
   a review thread on the merge request) in the matching BB project. The item
   then shows a ⚡ pill linking to the thread.

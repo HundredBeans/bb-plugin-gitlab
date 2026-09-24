@@ -40,6 +40,14 @@ import type { gitlabRpcContract } from "./server";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
@@ -129,18 +137,65 @@ interface IssueDetail {
 }
 
 interface Job {
+  id: number;
   name: string;
-  status: "success" | "failure" | "pending" | "neutral";
+  stage: string;
+  /** "warning" is a failed job the pipeline is allowed to ignore. */
+  status: "success" | "failure" | "warning" | "pending" | "neutral";
   /** GitLab's own word for it — "manual", "skipped", "canceled", … */
   rawStatus: string;
   url: string;
 }
 
-interface Discussion {
+interface Pipeline {
+  id: number;
+  status: string;
+  url: string;
+}
+
+interface TimelineNote {
+  id: number;
+  author: string;
+  body: string;
+  createdAt: string;
+  /** GitLab's own event text, e.g. "changed this line in version 2". */
+  system: boolean;
+}
+
+/** Where an inline thread sits; line fields are null for a whole file. */
+interface DiffPosition {
   path: string;
+  /** "old" only for a removed line. */
+  side: "new" | "old";
   line: number | null;
+  endLine: number | null;
+  /** The commit holding that copy of the file. */
+  ref: string | null;
+}
+
+interface TimelineEntry {
+  /** GitLab's discussion id. */
+  id: string;
+  kind: "event" | "comment" | "thread";
+  resolvable: boolean;
   resolved: boolean;
-  notes: Note[];
+  resolvedBy: string | null;
+  position: DiffPosition | null;
+  notes: TimelineNote[];
+}
+
+/** The parts of a merge request that move while it is open. */
+interface MergeRequestStatus {
+  state: string;
+  draft: boolean;
+  sha: string;
+  /** GitLab's detailed_merge_status, e.g. "mergeable", "need_rebase". */
+  mergeStatus: string;
+  hasConflicts: boolean;
+  /** True while "merge when the pipeline succeeds" is set. */
+  autoMerge: boolean;
+  pipeline: Pipeline | null;
+  jobs: Job[];
 }
 
 interface DiffFile {
@@ -152,12 +207,10 @@ interface DiffFile {
   patch: string | null;
 }
 
-interface MergeRequestDetail {
+interface MergeRequestDetail extends MergeRequestStatus {
   project: string;
   iid: number;
   title: string;
-  state: string;
-  draft: boolean;
   author: string;
   body: string;
   url: string;
@@ -175,15 +228,22 @@ interface MergeRequestDetail {
   labels: string[];
   assignees: string[];
   reviewers: string[];
-  mergeStatus: string;
-  hasConflicts: boolean;
   approvalsRequired: number;
   approvalsLeft: number;
   approvedBy: string[];
-  pipeline: { status: string; url: string } | null;
-  jobs: Job[];
-  notes: Note[];
-  discussions: Discussion[];
+  userHasApproved: boolean;
+  userCanApprove: boolean;
+  canMerge: boolean;
+  /** Merge defaults, as GitLab's own merge widget would pre-fill them. */
+  squash: boolean;
+  /** "always" and "never" lock the squash choice for the project. */
+  squashOption: "always" | "never" | "default_on" | "default_off";
+  removeSourceBranch: boolean;
+  mergeError: string | null;
+  blockingDiscussionsResolved: boolean;
+  timeline: TimelineEntry[];
+  /** Set when the discussions could not be read. */
+  timelineError: string | null;
   files: DiffFile[];
 }
 
@@ -1201,10 +1261,13 @@ function AssigneePicker({
   project,
   assignees,
   onToggle,
+  label = "Assignees",
 }: {
   project: string;
+  /** The users currently picked — assignees, or reviewers with `label`. */
   assignees: string[];
   onToggle: (username: string, assigned: boolean) => void;
+  label?: string;
 }) {
   const rpc = useRpc<typeof gitlabRpcContract>();
   const viewer = useViewer();
@@ -1232,13 +1295,13 @@ function AssigneePicker({
           size="sm"
           variant="ghost"
           className="h-6 px-2 text-xs text-muted-foreground"
-          aria-label="Edit assignees"
+          aria-label={`Edit ${label.toLowerCase()}`}
         >
           Edit
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="max-h-72 w-56 overflow-y-auto">
-        <DropdownMenuLabel>Assignees</DropdownMenuLabel>
+        <DropdownMenuLabel>{label}</DropdownMenuLabel>
         {loadError !== null ? (
           <DropdownMenuItem disabled>{loadError}</DropdownMenuItem>
         ) : ordered === null ? (
@@ -1570,202 +1633,1303 @@ function IssueDetailView({
 }
 
 // ---------------------------------------------------------------------------
-// Merge-request detail — pipeline, approvals, discussions, diffs. One
-// component serves both the nav panel (two-column, metadata sidebar) and the
-// thread side panel (single column via `compact`).
+// Merge-request detail — the merge box (approvals, pipeline, merge: the
+// actions GitLab's own merge widget offers), reviewers and assignees, the
+// activity timeline, and diffs. One component serves both the nav panel
+// (two-column, metadata sidebar) and the thread side panel (single column via
+// `compact`).
 // ---------------------------------------------------------------------------
+
+/** Pipeline statuses that are still moving. */
+const PIPELINE_ACTIVE = new Set([
+  "created",
+  "waiting_for_resource",
+  "preparing",
+  "pending",
+  "running",
+  "scheduled",
+]);
+/** Merge statuses that mean GitLab has not decided yet. */
+const MERGE_CHECKING = new Set([
+  "checking",
+  "unchecked",
+  "preparing",
+  "approvals_syncing",
+]);
 
 function jobDotClass(status: Job["status"]): string {
   if (status === "success") return "bg-primary";
   if (status === "failure") return "bg-destructive";
+  if (status === "warning") return "bg-amber-500";
   if (status === "pending") return "animate-pulse bg-muted-foreground";
   return "bg-muted-foreground/50";
 }
 
-/** GitLab's pipeline, with its jobs — the panel's answer to "is it green?". */
-function PipelineSection({
-  pipeline,
-  jobs,
-}: {
-  pipeline: MergeRequestDetail["pipeline"];
-  jobs: Job[];
-}) {
-  const [open, setOpen] = useState(() =>
-    jobs.some((job) => job.status === "failure"),
+function pipelineDotClass(status: string): string {
+  if (status === "success") return "bg-primary";
+  if (status === "failed") return "bg-destructive";
+  if (PIPELINE_ACTIVE.has(status)) return "animate-pulse bg-muted-foreground";
+  return "bg-muted-foreground/50";
+}
+
+/**
+ * GitLab's detailed_merge_status in plain words, and whether it is a state
+ * the viewer can act on now ("ready"), must wait for ("waiting"), or must fix
+ * first ("blocked").
+ */
+function mergeReadiness(status: string): {
+  text: string;
+  tone: "ready" | "waiting" | "blocked";
+} {
+  switch (status) {
+    case "mergeable":
+      return { text: "Ready to merge", tone: "ready" };
+    case "ci_still_running":
+      return { text: "Waiting for the pipeline to finish", tone: "waiting" };
+    case "ci_must_pass":
+      return { text: "The pipeline must pass first", tone: "blocked" };
+    case "discussions_not_resolved":
+      return { text: "All threads must be resolved first", tone: "blocked" };
+    case "draft_status":
+      return {
+        text: "This is a draft. Mark it as ready on GitLab first",
+        tone: "blocked",
+      };
+    case "need_rebase":
+      return {
+        text: "The source branch must be rebased onto the target",
+        tone: "blocked",
+      };
+    case "not_approved":
+      return { text: "It needs approval first", tone: "blocked" };
+    case "requested_changes":
+      return { text: "A reviewer requested changes", tone: "blocked" };
+    case "conflict":
+      return { text: "There are merge conflicts", tone: "blocked" };
+    case "blocked_status":
+    case "merge_request_blocked":
+      return {
+        text: "Another merge request must be merged first",
+        tone: "blocked",
+      };
+    case "security_policy_violations":
+      return { text: "A security policy blocks the merge", tone: "blocked" };
+    case "jira_association_missing":
+      return {
+        text: "The title or description needs a Jira issue key",
+        tone: "blocked",
+      };
+    case "external_status_checks":
+    case "status_checks_must_pass":
+      return { text: "External status checks must pass", tone: "blocked" };
+    case "commits_status":
+      return {
+        text: "The source branch has no commits or no longer exists",
+        tone: "blocked",
+      };
+    case "locked_paths":
+    case "locked_lfs_files":
+      return { text: "Locked files block the merge", tone: "blocked" };
+    case "title_regex":
+      return {
+        text: "The title does not match the required pattern",
+        tone: "blocked",
+      };
+    case "not_open":
+      return { text: "It is not open", tone: "blocked" };
+    default:
+      if (MERGE_CHECKING.has(status)) {
+        return {
+          text: "GitLab is checking if it can be merged…",
+          tone: "waiting",
+        };
+      }
+      return { text: status.replace(/_/g, " "), tone: "blocked" };
+  }
+}
+
+/**
+ * Runs one merge-request action at a time: `busy` names the running one so
+ * its button can say so, a failure becomes a toast, and a success reloads.
+ */
+function useMergeRequestAction(onDone: () => void): {
+  busy: string | null;
+  run: (key: string, action: () => Promise<unknown>, success: string) => void;
+} {
+  const [busy, setBusy] = useState<string | null>(null);
+  const run = useCallback(
+    (key: string, action: () => Promise<unknown>, success: string) => {
+      setBusy(key);
+      action()
+        .then(() => {
+          toast.success(success);
+          onDone();
+        })
+        .catch((error: unknown) => toast.error(errorText(error)))
+        .finally(() => setBusy(null));
+    },
+    [onDone],
   );
-  if (pipeline === null && jobs.length === 0) return null;
-  const passing = jobs.filter((job) => job.status === "success").length;
-  const failing = jobs.filter((job) => job.status === "failure").length;
-  const summaryDot =
-    failing > 0
-      ? "bg-destructive"
-      : jobs.length > 0 && passing === jobs.length
-        ? "bg-primary"
-        : "animate-pulse bg-muted-foreground";
+  return { busy, run };
+}
+
+function WidgetRow({
+  dot,
+  children,
+  actions,
+}: {
+  dot: string;
+  children: React.ReactNode;
+  actions?: React.ReactNode;
+}) {
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-card">
-      <button
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent/50"
-        onClick={() => setOpen((prev) => !prev)}
-        aria-expanded={open}
-      >
-        <span className={`size-2 shrink-0 rounded-full ${summaryDot}`} />
-        <span className="font-medium text-foreground">Pipeline</span>
-        <span className="min-w-0 truncate text-xs text-muted-foreground">
-          {pipeline !== null ? pipeline.status : "no pipeline"}
-          {jobs.length > 0
-            ? ` · ${passing}/${jobs.length} jobs passing${failing > 0 ? ` · ${failing} failing` : ""}`
-            : ""}
-        </span>
-        <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-          {open ? "▾" : "▸"}
-        </span>
-      </button>
-      {open ? (
-        <div className="divide-y divide-border border-t border-border">
-          {pipeline !== null && pipeline.url.length > 0 ? (
-            <p className="px-3 py-1.5 text-xs">
-              <a
-                href={pipeline.url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-muted-foreground underline hover:text-foreground"
-              >
-                Pipeline on GitLab ↗
-              </a>
-            </p>
-          ) : null}
-          {jobs.map((job, index) => (
-            <div
-              key={`${job.name}-${index}`}
-              className="flex items-center gap-2 px-3 py-1.5 text-xs"
-            >
-              <span
-                className={`size-2 shrink-0 rounded-full ${jobDotClass(job.status)}`}
-              />
-              <span className="min-w-0 flex-1 truncate text-foreground">
-                {job.name}
-              </span>
-              <span className="shrink-0 text-muted-foreground">
-                {job.rawStatus}
-              </span>
-              {job.url.length > 0 ? (
-                <a
-                  href={job.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="shrink-0 text-muted-foreground underline hover:text-foreground"
-                >
-                  job ↗
-                </a>
-              ) : null}
-            </div>
-          ))}
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-3 py-2">
+      <span className={`size-2 shrink-0 rounded-full ${dot}`} />
+      <div className="min-w-0 flex-1 text-sm">{children}</div>
+      {actions !== undefined ? (
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+          {actions}
         </div>
       ) : null}
     </div>
   );
 }
 
-function ApprovalsSummary({ mr }: { mr: MergeRequestDetail }) {
+function ApprovalRow({
+  mr,
+  busy,
+  run,
+}: {
+  mr: MergeRequestDetail;
+  busy: string | null;
+  run: ReturnType<typeof useMergeRequestAction>["run"];
+}) {
+  const rpc = useRpc<typeof gitlabRpcContract>();
   const approved = Math.max(0, mr.approvalsRequired - mr.approvalsLeft);
-  const label =
+  const summary =
     mr.approvalsRequired === 0
       ? mr.approvedBy.length > 0
-        ? `${mr.approvedBy.length} approval${mr.approvedBy.length === 1 ? "" : "s"} · none required`
-        : "No approvals required"
+        ? "Approved · none required"
+        : "No approval required"
       : mr.approvalsLeft === 0
-        ? `Approved · ${approved}/${mr.approvalsRequired}`
-        : `${approved}/${mr.approvalsRequired} approvals · ${mr.approvalsLeft} left`;
+        ? `Approved · ${approved} of ${mr.approvalsRequired}`
+        : `${approved} of ${mr.approvalsRequired} approvals · needs ${mr.approvalsLeft} more`;
+  const dot =
+    mr.approvalsRequired > 0 && mr.approvalsLeft > 0
+      ? "bg-muted-foreground/50"
+      : "bg-primary";
+  const open = mr.state === "opened";
+  const setApproval = (next: boolean) =>
+    run(
+      "approve",
+      () =>
+        rpc.call("setApproval", {
+          project: mr.project,
+          iid: mr.iid,
+          approved: next,
+          sha: mr.sha,
+        }),
+      next ? `Approved !${mr.iid}` : `Approval revoked on !${mr.iid}`,
+    );
   return (
-    <div className="flex flex-col gap-1">
-      <p
-        className={`text-sm ${
-          mr.approvalsRequired > 0 && mr.approvalsLeft === 0
-            ? "text-foreground"
-            : "text-muted-foreground"
-        }`}
-      >
-        {label}
-      </p>
-      {mr.approvedBy.map((username) => (
-        <UserLine key={username} username={username} />
-      ))}
+    <WidgetRow
+      dot={dot}
+      actions={
+        open && mr.userHasApproved ? (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy !== null}
+            onClick={() => setApproval(false)}
+          >
+            {busy === "approve" ? "Revoking…" : "Revoke approval"}
+          </Button>
+        ) : open && mr.userCanApprove ? (
+          <Button
+            size="sm"
+            disabled={busy !== null}
+            onClick={() => setApproval(true)}
+          >
+            {busy === "approve" ? "Approving…" : "Approve"}
+          </Button>
+        ) : undefined
+      }
+    >
+      <span className="text-foreground">{summary}</span>
+      {mr.approvedBy.length > 0 ? (
+        <span className="text-muted-foreground">
+          {" "}
+          · by {mr.approvedBy.join(", ")}
+        </span>
+      ) : null}
+    </WidgetRow>
+  );
+}
+
+function jobCounts(jobs: Job[]): string {
+  const count = (status: Job["status"]) =>
+    jobs.filter((job) => job.status === status).length;
+  const parts = [
+    [count("failure"), "failed"],
+    [count("warning"), "allowed to fail"],
+    [count("pending"), "running"],
+    [jobs.filter((job) => job.rawStatus === "manual").length, "manual"],
+    [count("success"), "passed"],
+  ] as const;
+  return parts
+    .filter(([n]) => n > 0)
+    .map(([n, word]) => `${n} ${word}`)
+    .join(" · ");
+}
+
+function JobRow({
+  job,
+  project,
+  busy,
+  run,
+}: {
+  job: Job;
+  project: string;
+  busy: string | null;
+  run: ReturnType<typeof useMergeRequestAction>["run"];
+}) {
+  const rpc = useRpc<typeof gitlabRpcContract>();
+  const act = (action: "play" | "retry" | "cancel", success: string) =>
+    run(
+      `job-${job.id}`,
+      () => rpc.call("jobAction", { project, jobId: job.id, action }),
+      success,
+    );
+  const running = busy === `job-${job.id}`;
+  const action =
+    job.rawStatus === "manual"
+      ? { label: "Run", onClick: () => act("play", `Started ${job.name}`) }
+      : job.rawStatus === "failed" || job.rawStatus === "canceled"
+        ? { label: "Retry", onClick: () => act("retry", `Retrying ${job.name}`) }
+        : PIPELINE_ACTIVE.has(job.rawStatus)
+          ? {
+              label: "Cancel",
+              onClick: () => act("cancel", `Canceled ${job.name}`),
+            }
+          : null;
+  return (
+    <div className="flex items-center gap-2 px-3 py-1 text-xs">
+      <span
+        className={`size-2 shrink-0 rounded-full ${jobDotClass(job.status)}`}
+      />
+      <span className="min-w-0 flex-1 truncate text-foreground" title={job.name}>
+        {job.name}
+      </span>
+      <span className="shrink-0 text-muted-foreground">
+        {job.status === "warning" ? "failed (allowed)" : job.rawStatus}
+      </span>
+      {action !== null ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 px-2 text-xs"
+          disabled={busy !== null}
+          onClick={action.onClick}
+        >
+          {running ? "…" : action.label}
+        </Button>
+      ) : null}
+      {job.url.length > 0 ? (
+        <a
+          href={job.url}
+          target="_blank"
+          rel="noreferrer"
+          className="shrink-0 text-muted-foreground underline hover:text-foreground"
+          title="Open the job log on GitLab"
+        >
+          log ↗
+        </a>
+      ) : null}
     </div>
   );
 }
 
-/** An inline discussion: file/line header, resolved state, comment chain. */
-function DiscussionCard({ discussion }: { discussion: Discussion }) {
+function PipelineRow({
+  mr,
+  busy,
+  run,
+}: {
+  mr: MergeRequestDetail;
+  busy: string | null;
+  run: ReturnType<typeof useMergeRequestAction>["run"];
+}) {
+  const rpc = useRpc<typeof gitlabRpcContract>();
+  const { pipeline, jobs } = mr;
+  const [open, setOpen] = useState(() =>
+    jobs.some((job) => job.status === "failure" || job.rawStatus === "manual"),
+  );
+  const stages = useMemo(() => {
+    const byStage = new Map<string, Job[]>();
+    for (const job of jobs) {
+      const list = byStage.get(job.stage);
+      if (list === undefined) byStage.set(job.stage, [job]);
+      else list.push(job);
+    }
+    return [...byStage.entries()];
+  }, [jobs]);
+  const isOpen = mr.state === "opened";
+  const active = pipeline !== null && PIPELINE_ACTIVE.has(pipeline.status);
+  const canRetry =
+    pipeline !== null &&
+    !active &&
+    (pipeline.status === "failed" ||
+      pipeline.status === "canceled" ||
+      jobs.some((job) => job.status === "failure"));
+
+  const actions = (
+    <>
+      {isOpen ? (
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy !== null}
+          onClick={() =>
+            run(
+              "run-pipeline",
+              () =>
+                rpc.call("runPipeline", { project: mr.project, iid: mr.iid }),
+              "Pipeline started",
+            )
+          }
+        >
+          {busy === "run-pipeline" ? "Starting…" : "Run pipeline"}
+        </Button>
+      ) : null}
+      {pipeline !== null && canRetry ? (
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy !== null}
+          onClick={() =>
+            run(
+              "retry-pipeline",
+              () =>
+                rpc.call("pipelineAction", {
+                  project: mr.project,
+                  pipelineId: pipeline.id,
+                  action: "retry",
+                }),
+              "Retrying failed jobs",
+            )
+          }
+        >
+          {busy === "retry-pipeline" ? "Retrying…" : "Retry failed"}
+        </Button>
+      ) : null}
+      {pipeline !== null && active ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={busy !== null}
+          onClick={() =>
+            run(
+              "cancel-pipeline",
+              () =>
+                rpc.call("pipelineAction", {
+                  project: mr.project,
+                  pipelineId: pipeline.id,
+                  action: "cancel",
+                }),
+              "Pipeline canceled",
+            )
+          }
+        >
+          {busy === "cancel-pipeline" ? "Canceling…" : "Cancel"}
+        </Button>
+      ) : null}
+    </>
+  );
+
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-card">
-      <p className="flex items-center gap-2 border-b border-border bg-muted/50 px-3 py-1.5 font-mono text-xs text-muted-foreground">
-        <span className="min-w-0 truncate">
-          {discussion.path.length > 0 ? discussion.path : "(no file)"}
-        </span>
-        {discussion.line !== null ? (
-          <span className="shrink-0">:{discussion.line}</span>
-        ) : null}
-        <span className="ml-auto shrink-0">
-          <Badge
-            variant={discussion.resolved ? "secondary" : "outline"}
-            className="font-normal"
+    <div>
+      <WidgetRow
+        dot={
+          pipeline === null
+            ? "bg-muted-foreground/50"
+            : pipelineDotClass(pipeline.status)
+        }
+        actions={actions}
+      >
+        {pipeline === null ? (
+          <span className="text-muted-foreground">No pipeline yet</span>
+        ) : (
+          <button
+            className="flex min-w-0 max-w-full items-center gap-1.5 text-left"
+            onClick={() => setOpen((prev) => !prev)}
+            aria-expanded={open}
+            disabled={jobs.length === 0}
           >
-            {discussion.resolved ? "resolved" : "unresolved"}
-          </Badge>
-        </span>
-      </p>
-      <div className="flex flex-col gap-3 p-3">
-        {discussion.notes.map((note, index) => (
-          <div key={index}>
-            <p className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
-              <Avatar username={note.author} size="size-4" />
-              <span className="font-medium text-foreground">{note.author}</span>{" "}
-              · {relativeTime(note.createdAt)}
+            <span className="font-medium text-foreground">
+              Pipeline {pipeline.status}
+            </span>
+            {jobs.length > 0 ? (
+              <span className="min-w-0 truncate text-xs text-muted-foreground">
+                {jobCounts(jobs)}
+              </span>
+            ) : null}
+            {jobs.length > 0 ? (
+              <span className="shrink-0 text-xs text-muted-foreground">
+                {open ? "▾" : "▸"}
+              </span>
+            ) : null}
+          </button>
+        )}
+      </WidgetRow>
+      {open && pipeline !== null ? (
+        <div className="border-t border-border bg-muted/20 py-1">
+          {stages.map(([stage, stageJobs]) => (
+            <div key={stage} className="py-0.5">
+              {stages.length > 1 && stage.length > 0 ? (
+                <p className="px-3 pt-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  {stage}
+                </p>
+              ) : null}
+              {stageJobs.map((job) => (
+                <JobRow
+                  key={job.id}
+                  job={job}
+                  project={mr.project}
+                  busy={busy}
+                  run={run}
+                />
+              ))}
+            </div>
+          ))}
+          {pipeline.url.length > 0 ? (
+            <p className="px-3 pt-1 text-xs">
+              <a
+                href={pipeline.url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-muted-foreground underline hover:text-foreground"
+              >
+                Pipeline #{pipeline.id} on GitLab ↗
+              </a>
             </p>
-            <Markdown content={note.body} className="text-sm" />
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function MergeRow({
+  mr,
+  busy,
+  run,
+}: {
+  mr: MergeRequestDetail;
+  busy: string | null;
+  run: ReturnType<typeof useMergeRequestAction>["run"];
+}) {
+  const rpc = useRpc<typeof gitlabRpcContract>();
+  const [squash, setSquash] = useState(mr.squash);
+  const [removeSourceBranch, setRemoveSourceBranch] = useState(
+    mr.removeSourceBranch,
+  );
+  const [confirming, setConfirming] = useState<"merge" | "auto" | null>(null);
+  // A reload after another action brings fresh defaults; keep them in step
+  // unless the viewer is in the middle of confirming.
+  useEffect(() => {
+    if (confirming === null) {
+      setSquash(mr.squash);
+      setRemoveSourceBranch(mr.removeSourceBranch);
+    }
+  }, [mr.squash, mr.removeSourceBranch]);
+
+  if (mr.state === "merged") {
+    return (
+      <WidgetRow dot="bg-primary">
+        <span className="font-medium text-foreground">Merged</span>
+      </WidgetRow>
+    );
+  }
+  if (mr.state !== "opened") {
+    return (
+      <WidgetRow dot="bg-muted-foreground/50">
+        <span className="text-muted-foreground">
+          This merge request is {mr.state}.
+        </span>
+      </WidgetRow>
+    );
+  }
+
+  const readiness = mergeReadiness(mr.mergeStatus);
+  const pipelineActive =
+    mr.pipeline !== null && PIPELINE_ACTIVE.has(mr.pipeline.status);
+  // As on GitLab: while a pipeline runs, waiting for it comes first, even in
+  // a project that would allow merging right away ("mergeable"). If the
+  // pipeline has already passed when the request lands, GitLab merges now.
+  const canAutoMerge =
+    pipelineActive &&
+    (mr.mergeStatus === "ci_still_running" ||
+      mr.mergeStatus === "ci_must_pass" ||
+      mr.mergeStatus === "mergeable");
+  const squashLocked =
+    mr.squashOption === "always" || mr.squashOption === "never";
+  const dot =
+    readiness.tone === "ready"
+      ? "bg-primary"
+      : readiness.tone === "waiting"
+        ? "animate-pulse bg-muted-foreground"
+        : "bg-destructive";
+
+  const merge = (autoMerge: boolean) => {
+    setConfirming(null);
+    run(
+      "merge",
+      () =>
+        rpc.call("mergeMergeRequest", {
+          project: mr.project,
+          iid: mr.iid,
+          sha: mr.sha,
+          squash,
+          removeSourceBranch,
+          autoMerge,
+        }),
+      autoMerge
+        ? `!${mr.iid} will merge when the pipeline succeeds`
+        : `Merged !${mr.iid}`,
+    );
+  };
+
+  let actions: React.ReactNode;
+  if (mr.autoMerge) {
+    actions = (
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={busy !== null}
+        onClick={() =>
+          run(
+            "cancel-auto-merge",
+            () =>
+              rpc.call("cancelAutoMerge", { project: mr.project, iid: mr.iid }),
+            "Auto-merge canceled",
+          )
+        }
+      >
+        {busy === "cancel-auto-merge" ? "Canceling…" : "Cancel auto-merge"}
+      </Button>
+    );
+  } else if (mr.canMerge) {
+    actions = (
+      <>
+        {mr.mergeStatus === "need_rebase" ? (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy !== null}
+            onClick={() =>
+              run(
+                "rebase",
+                () =>
+                  rpc.call("rebaseMergeRequest", {
+                    project: mr.project,
+                    iid: mr.iid,
+                  }),
+                "Rebase started",
+              )
+            }
+          >
+            {busy === "rebase" ? "Starting…" : "Rebase"}
+          </Button>
+        ) : null}
+        {canAutoMerge ? (
+          <>
+            {mr.mergeStatus === "mergeable" ? (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy !== null}
+                onClick={() => setConfirming("merge")}
+              >
+                Merge now
+              </Button>
+            ) : null}
+            <Button
+              size="sm"
+              disabled={busy !== null}
+              onClick={() => setConfirming("auto")}
+            >
+              {busy === "merge" ? "Setting…" : "Set to auto-merge"}
+            </Button>
+          </>
+        ) : (
+          <Button
+            size="sm"
+            disabled={busy !== null || mr.mergeStatus !== "mergeable"}
+            onClick={() => setConfirming("merge")}
+          >
+            {busy === "merge" ? "Merging…" : "Merge"}
+          </Button>
+        )}
+      </>
+    );
+  }
+
+  return (
+    <div>
+      <WidgetRow dot={dot} actions={actions}>
+        <span className="text-foreground">
+          {mr.autoMerge
+            ? "Set to merge when the pipeline succeeds"
+            : readiness.text}
+        </span>
+        {!mr.canMerge && !mr.autoMerge ? (
+          <span className="text-muted-foreground">
+            {" "}
+            · you cannot merge this
+          </span>
+        ) : null}
+      </WidgetRow>
+      {mr.mergeError !== null ? (
+        <p className="px-3 pb-2 pl-7 text-xs text-destructive">
+          Last merge attempt failed: {mr.mergeError}
+        </p>
+      ) : null}
+      {mr.canMerge && !mr.autoMerge ? (
+        <div className="flex flex-wrap gap-x-4 gap-y-1 px-3 pb-2 pl-7 text-xs text-muted-foreground">
+          <label
+            className="flex items-center gap-1.5"
+            title={
+              squashLocked
+                ? `The project ${mr.squashOption === "always" ? "always" : "never"} squashes commits`
+                : undefined
+            }
+          >
+            <input
+              type="checkbox"
+              className="accent-primary"
+              checked={squash}
+              disabled={squashLocked || busy !== null}
+              onChange={(event) => setSquash(event.target.checked)}
+            />
+            Squash commits
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input
+              type="checkbox"
+              className="accent-primary"
+              checked={removeSourceBranch}
+              disabled={busy !== null}
+              onChange={(event) => setRemoveSourceBranch(event.target.checked)}
+            />
+            Delete source branch
+          </label>
+        </div>
+      ) : null}
+      <Dialog
+        open={confirming !== null}
+        onOpenChange={(next) => {
+          if (!next) setConfirming(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>
+              {confirming === "auto"
+                ? `Merge !${mr.iid} when the pipeline succeeds?`
+                : `Merge !${mr.iid}?`}
+            </DialogTitle>
+            <DialogDescription>{mr.title}</DialogDescription>
+          </DialogHeader>
+          <ul className="flex flex-col gap-1 text-sm text-foreground">
+            <li className="font-mono text-xs">
+              {mr.sourceBranch} → {mr.targetBranch}
+            </li>
+            <li>
+              {squash
+                ? "Commits will be squashed"
+                : "Commits will not be squashed"}
+            </li>
+            <li>
+              {removeSourceBranch
+                ? "The source branch will be deleted"
+                : "The source branch will be kept"}
+            </li>
+          </ul>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirming(null)}>
+              Cancel
+            </Button>
+            <Button onClick={() => merge(confirming === "auto")}>
+              {confirming === "auto" ? "Set to auto-merge" : "Merge"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+function MergeWidget({
+  mr,
+  onChanged,
+}: {
+  mr: MergeRequestDetail;
+  onChanged: () => void;
+}) {
+  const { busy, run } = useMergeRequestAction(onChanged);
+  return (
+    <div className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
+      <ApprovalRow mr={mr} busy={busy} run={run} />
+      <PipelineRow mr={mr} busy={busy} run={run} />
+      <MergeRow mr={mr} busy={busy} run={run} />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Reviewers and assignees, editable in both the page and the side panel.
+// ---------------------------------------------------------------------------
+
+function PeopleList({
+  label,
+  empty,
+  project,
+  users,
+  onChange,
+}: {
+  label: string;
+  empty: string;
+  project: string;
+  users: string[];
+  onChange: (next: string[]) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center justify-between">
+        <SidebarHeading>{label}</SidebarHeading>
+        <AssigneePicker
+          project={project}
+          assignees={users}
+          label={label}
+          onToggle={(username, picked) =>
+            onChange(
+              picked
+                ? [...new Set([...users, username])]
+                : users.filter((entry) => entry !== username),
+            )
+          }
+        />
+      </div>
+      {users.length === 0 ? (
+        <p className="text-sm text-muted-foreground">{empty}</p>
+      ) : (
+        users.map((username) => <UserLine key={username} username={username} />)
+      )}
+    </div>
+  );
+}
+
+function PeopleSection({
+  mr,
+  onPeople,
+  className,
+}: {
+  mr: MergeRequestDetail;
+  /** Local update first, then the server's own answer (or a reload). */
+  onPeople: (people: { reviewers?: string[]; assignees?: string[] }) => void;
+  className?: string;
+}) {
+  return (
+    <div className={className ?? "flex flex-col gap-5"}>
+      <PeopleList
+        label="Reviewers"
+        empty="No reviewers"
+        project={mr.project}
+        users={mr.reviewers}
+        onChange={(reviewers) => onPeople({ reviewers })}
+      />
+      <PeopleList
+        label="Assignees"
+        empty="No one assigned"
+        project={mr.project}
+        users={mr.assignees}
+        onChange={(assignees) => onPeople({ assignees })}
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Activity: GitLab's discussions as one timeline. Events are one line each,
+// a lone comment is a card, and a thread keeps its replies under it, with
+// the code it is about, a reply box, and resolve.
+// ---------------------------------------------------------------------------
+
+type ActivityFilter = "all" | "comments" | "unresolved";
+const ACTIVITY_FILTER_KEY = "bb-plugin-gitlab:activity-filter";
+
+function readActivityFilter(): ActivityFilter {
+  try {
+    const saved = localStorage.getItem(ACTIVITY_FILTER_KEY);
+    return saved === "comments" || saved === "unresolved" ? saved : "all";
+  } catch {
+    return "all";
+  }
+}
+
+/** The first line of a system note as plain text: links and tags dropped. */
+function eventText(body: string): string {
+  const first =
+    body
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.length > 0) ?? "";
+  return first
+    .replace(/<[^>]+>/g, "")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/\*\*|__|`/g, "");
+}
+
+interface Snippet {
+  startLine: number;
+  lines: string[];
+}
+
+// A commit's copy of a file never changes, so snippets are cached for the
+// life of the page and shared by every thread on the same lines.
+const snippetCache = new Map<string, Promise<Snippet>>();
+
+function DiffSnippet({
+  project,
+  position,
+}: {
+  project: string;
+  position: DiffPosition;
+}) {
+  const rpc = useRpc<typeof gitlabRpcContract>();
+  const [snippet, setSnippet] = useState<Snippet | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const { ref, path, line, endLine } = position;
+  useEffect(() => {
+    if (ref === null || line === null) return;
+    const last = endLine ?? line;
+    const key = `${project}|${ref}|${path}|${line}|${last}`;
+    let request = snippetCache.get(key);
+    if (request === undefined) {
+      request = rpc.call("getDiffSnippet", {
+        project,
+        ref,
+        path,
+        line,
+        endLine: last,
+      });
+      snippetCache.set(key, request);
+      request.catch(() => snippetCache.delete(key));
+    }
+    let cancelled = false;
+    request.then(
+      (result) => {
+        if (!cancelled) setSnippet(result);
+      },
+      (err: unknown) => {
+        if (!cancelled) setError(errorText(err));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc, project, ref, path, line, endLine]);
+
+  if (ref === null || line === null) return null;
+  if (error !== null) {
+    return (
+      <p className="border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+        Could not load the code: {error}
+      </p>
+    );
+  }
+  if (snippet === null) {
+    return (
+      <div className="border-b border-border px-3 py-2">
+        <Skeleton className="h-12 w-full" />
+      </div>
+    );
+  }
+  const last = endLine ?? line;
+  const hit =
+    position.side === "old" ? "bg-destructive/10" : "bg-primary/10";
+  return (
+    <div className="overflow-x-auto border-b border-border bg-muted/30 py-1 font-mono text-xs leading-5">
+      {snippet.lines.map((text, index) => {
+        const number = snippet.startLine + index;
+        const marked = number >= line && number <= last;
+        return (
+          <div key={number} className={`flex min-w-max ${marked ? hit : ""}`}>
+            <span className="w-12 shrink-0 select-none pr-3 text-right text-muted-foreground">
+              {number}
+            </span>
+            <span className="whitespace-pre pr-3 text-foreground/90">
+              {text.length > 0 ? text : " "}
+            </span>
           </div>
-        ))}
+        );
+      })}
+    </div>
+  );
+}
+
+function ReplyBox({
+  onSubmit,
+  placeholder = "Reply…",
+}: {
+  onSubmit: (body: string) => Promise<void>;
+  placeholder?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [body, setBody] = useState("");
+  const [posting, setPosting] = useState(false);
+  const submit = () => {
+    if (body.trim().length === 0 || posting) return;
+    setPosting(true);
+    onSubmit(body)
+      .then(() => {
+        setBody("");
+        setOpen(false);
+      })
+      .catch((error: unknown) => toast.error(errorText(error)))
+      .finally(() => setPosting(false));
+  };
+  if (!open) {
+    return (
+      <button
+        className="w-full rounded-md border border-border px-3 py-1.5 text-left text-sm text-muted-foreground hover:bg-accent/50"
+        onClick={() => setOpen(true)}
+      >
+        {placeholder}
+      </button>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      <Textarea
+        autoFocus
+        value={body}
+        onChange={(event) => setBody(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            submit();
+          }
+        }}
+        placeholder="Write a reply… (Ctrl+Enter to send)"
+        aria-label="Reply"
+        rows={3}
+      />
+      <div className="flex justify-end gap-2">
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={posting}
+          onClick={() => {
+            setOpen(false);
+            setBody("");
+          }}
+        >
+          Cancel
+        </Button>
+        <Button
+          size="sm"
+          disabled={posting || body.trim().length === 0}
+          onClick={submit}
+        >
+          {posting ? "Sending…" : "Reply"}
+        </Button>
       </div>
     </div>
   );
 }
 
-function DiscussionsSection({
-  discussions,
+function NoteBody({ note }: { note: TimelineNote }) {
+  if (note.system) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        <span className="font-medium">{note.author}</span> {eventText(note.body)}{" "}
+        · {relativeTime(note.createdAt)}
+      </p>
+    );
+  }
+  return (
+    <div>
+      <p className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
+        <Avatar username={note.author} size="size-4" />
+        <span className="font-medium text-foreground">{note.author}</span>·{" "}
+        {relativeTime(note.createdAt)}
+      </p>
+      <Markdown content={note.body} className="text-sm" />
+    </div>
+  );
+}
+
+function EventRow({ entry }: { entry: TimelineEntry }) {
+  const note = entry.notes[0];
+  return (
+    <p className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
+      <Avatar username={note.author} size="size-4" />
+      <span className="min-w-0 truncate">
+        <span className="font-medium text-foreground/80">{note.author}</span>{" "}
+        {eventText(note.body)}
+      </span>
+      <span className="ml-auto shrink-0">{relativeTime(note.createdAt)}</span>
+    </p>
+  );
+}
+
+/** "12" or "12–15"; empty for a comment on the whole file. */
+function lineLabel(position: DiffPosition): string {
+  if (position.line === null) return "";
+  return position.endLine !== null && position.endLine !== position.line
+    ? `${position.line}–${position.endLine}`
+    : `${position.line}`;
+}
+
+function positionLabel(position: DiffPosition): string {
+  const lines = lineLabel(position);
+  return lines.length > 0 ? `${position.path}:${lines}` : position.path;
+}
+
+function ThreadCard({
+  entry,
+  project,
+  onReply,
+  onResolve,
 }: {
-  discussions: Discussion[];
+  entry: TimelineEntry;
+  project: string;
+  onReply: (discussionId: string, body: string) => Promise<void>;
+  onResolve: (discussionId: string, resolved: boolean) => Promise<void>;
 }) {
-  // Grouped by file, then in line order: reviewing reads file by file.
-  const groups = useMemo(() => {
-    const byPath = new Map<string, Discussion[]>();
-    for (const discussion of discussions) {
-      const existing = byPath.get(discussion.path);
-      if (existing === undefined) byPath.set(discussion.path, [discussion]);
-      else existing.push(discussion);
+  const [expanded, setExpanded] = useState(!entry.resolved);
+  const [resolving, setResolving] = useState(false);
+  const [first, ...replies] = entry.notes;
+  const comments = entry.notes.filter((note) => !note.system).length;
+  const toggleResolved = () => {
+    setResolving(true);
+    onResolve(entry.id, !entry.resolved)
+      .catch((error: unknown) => toast.error(errorText(error)))
+      .finally(() => setResolving(false));
+  };
+  const fileName = entry.position?.path.split("/").pop() ?? "";
+
+  return (
+    <div
+      className={`overflow-hidden rounded-lg border bg-card ${
+        entry.resolvable && !entry.resolved
+          ? "border-foreground/25"
+          : "border-border"
+      }`}
+    >
+      <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-3 py-1.5 text-xs text-muted-foreground">
+        <button
+          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+          onClick={() => setExpanded((prev) => !prev)}
+          aria-expanded={expanded}
+        >
+          <span className="shrink-0">{expanded ? "▾" : "▸"}</span>
+          {entry.position !== null ? (
+            <span
+              className="min-w-0 truncate font-mono"
+              title={positionLabel(entry.position)}
+            >
+              {/* The file name is what a reader scans for; the full path
+                  is one hover away. */}
+              {fileName}
+              {entry.position.line !== null
+                ? `:${lineLabel(entry.position)}`
+                : ""}
+            </span>
+          ) : (
+            <span className="min-w-0 truncate">Thread</span>
+          )}
+          {!expanded ? (
+            <span className="shrink-0">
+              · {comments} comment{comments === 1 ? "" : "s"}
+            </span>
+          ) : null}
+        </button>
+        {entry.resolvable ? (
+          <>
+            <Badge
+              variant={entry.resolved ? "secondary" : "outline"}
+              className="shrink-0 font-normal"
+              title={
+                entry.resolvedBy !== null
+                  ? `Resolved by ${entry.resolvedBy}`
+                  : undefined
+              }
+            >
+              {entry.resolved ? "resolved" : "unresolved"}
+            </Badge>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 shrink-0 px-2 text-xs"
+              disabled={resolving}
+              onClick={toggleResolved}
+            >
+              {resolving ? "…" : entry.resolved ? "Reopen" : "Resolve"}
+            </Button>
+          </>
+        ) : null}
+      </div>
+      {!expanded ? (
+        <button
+          className="block w-full truncate px-3 py-1.5 text-left text-xs text-muted-foreground hover:bg-accent/50"
+          onClick={() => setExpanded(true)}
+        >
+          <span className="font-medium text-foreground/80">{first.author}</span>:{" "}
+          {eventText(first.body)}
+        </button>
+      ) : (
+        <>
+          {entry.position !== null ? (
+            <DiffSnippet project={project} position={entry.position} />
+          ) : null}
+          <div className="flex flex-col gap-3 p-3">
+            <NoteBody note={first} />
+            {replies.length > 0 ? (
+              <div className="flex flex-col gap-3 border-l-2 border-border pl-3">
+                {replies.map((note) => (
+                  <NoteBody key={note.id} note={note} />
+                ))}
+              </div>
+            ) : null}
+            <ReplyBox onSubmit={(body) => onReply(entry.id, body)} />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function CommentEntry({
+  entry,
+  onReply,
+}: {
+  entry: TimelineEntry;
+  onReply: (discussionId: string, body: string) => Promise<void>;
+}) {
+  const note = entry.notes[0];
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
+      <NoteBody note={note} />
+      <ReplyBox onSubmit={(body) => onReply(entry.id, body)} />
+    </div>
+  );
+}
+
+function ActivitySection({
+  mr,
+  onChanged,
+}: {
+  mr: MergeRequestDetail;
+  onChanged: () => void;
+}) {
+  const rpc = useRpc<typeof gitlabRpcContract>();
+  const [filter, setFilter] = useState<ActivityFilter>(readActivityFilter);
+  const chooseFilter = (next: ActivityFilter) => {
+    setFilter(next);
+    try {
+      localStorage.setItem(ACTIVITY_FILTER_KEY, next);
+    } catch {
+      // private mode — the choice just won't persist
     }
-    return [...byPath.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([path, entries]) => ({
-        path,
-        entries: [...entries].sort((a, b) => (a.line ?? 0) - (b.line ?? 0)),
-      }));
-  }, [discussions]);
-  if (groups.length === 0) return null;
-  const unresolved = discussions.filter((entry) => !entry.resolved).length;
+  };
+  const unresolved = mr.timeline.filter(
+    (entry) => entry.resolvable && !entry.resolved,
+  ).length;
+  const visible = mr.timeline.filter((entry) =>
+    filter === "all"
+      ? true
+      : filter === "comments"
+        ? entry.kind !== "event"
+        : entry.resolvable && !entry.resolved,
+  );
+
+  const onReply = useCallback(
+    async (discussionId: string, body: string) => {
+      await rpc.call("replyToDiscussion", {
+        project: mr.project,
+        iid: mr.iid,
+        discussionId,
+        body,
+      });
+      onChanged();
+    },
+    [rpc, mr.project, mr.iid, onChanged],
+  );
+  const onResolve = useCallback(
+    async (discussionId: string, resolved: boolean) => {
+      await rpc.call("setDiscussionResolved", {
+        project: mr.project,
+        iid: mr.iid,
+        discussionId,
+        resolved,
+      });
+      onChanged();
+    },
+    [rpc, mr.project, mr.iid, onChanged],
+  );
+
+  const chip = (value: ActivityFilter, label: string) => (
+    <button
+      className={`rounded-md px-2 py-0.5 text-xs ${
+        filter === value
+          ? "bg-accent font-medium text-foreground"
+          : "text-muted-foreground hover:text-foreground"
+      }`}
+      onClick={() => chooseFilter(value)}
+      aria-pressed={filter === value}
+    >
+      {label}
+    </button>
+  );
+
   return (
     <div className="flex flex-col gap-2">
-      <h3 className="text-xs font-semibold text-muted-foreground">
-        Discussions · {discussions.length}
-        {unresolved > 0 ? ` · ${unresolved} unresolved` : ""}
-      </h3>
-      {groups.map((group) => (
-        <div key={group.path} className="flex flex-col gap-2">
-          {group.entries.map((discussion, index) => (
-            <DiscussionCard key={index} discussion={discussion} />
-          ))}
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-xs font-semibold text-muted-foreground">Activity</h3>
+        <div className="ml-auto flex items-center gap-1">
+          {chip("all", "All")}
+          {chip("comments", "Comments")}
+          {chip("unresolved", `Unresolved · ${unresolved}`)}
         </div>
-      ))}
+      </div>
+      {mr.timelineError !== null ? (
+        <p className="text-xs text-destructive">
+          Could not load the conversation: {mr.timelineError}
+        </p>
+      ) : visible.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          {filter === "unresolved"
+            ? "No unresolved threads."
+            : "No comments yet."}
+        </p>
+      ) : (
+        visible.map((entry) =>
+          entry.kind === "event" ? (
+            <EventRow key={entry.id} entry={entry} />
+          ) : entry.kind === "comment" ? (
+            <CommentEntry key={entry.id} entry={entry} onReply={onReply} />
+          ) : (
+            <ThreadCard
+              key={entry.id}
+              entry={entry}
+              project={mr.project}
+              onReply={onReply}
+              onResolve={onResolve}
+            />
+          ),
+        )
+      )}
     </div>
   );
 }
@@ -1927,6 +3091,52 @@ function FileDiffCard({ file, url }: { file: DiffFile; url: string }) {
   );
 }
 
+/**
+ * A long description folds, so the activity below it stays in reach; the
+ * narrow side panel folds sooner and shorter than the full page.
+ */
+const LONG_DESCRIPTION = { compact: 1200, full: 2500 };
+
+function DescriptionCard({
+  mr,
+  compact,
+}: {
+  mr: MergeRequestDetail;
+  compact: boolean;
+}) {
+  const long = mr.body.length > LONG_DESCRIPTION[compact ? "compact" : "full"];
+  const folded = compact
+    ? "max-h-64 overflow-hidden"
+    : "max-h-[36rem] overflow-hidden";
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="overflow-hidden rounded-lg border border-border bg-card">
+      <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-4 py-2 text-xs text-muted-foreground">
+        <Avatar username={mr.author} />
+        <span className="font-medium text-foreground">{mr.author}</span>
+        opened this merge request · updated {relativeTime(mr.updatedAt)}
+      </div>
+      <div className="p-4">
+        {mr.body.length > 0 ? (
+          <div className={long && !expanded ? folded : ""}>
+            <Markdown content={mr.body} className="text-sm" />
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">(no description)</p>
+        )}
+        {long ? (
+          <button
+            className="mt-2 text-xs text-muted-foreground underline hover:text-foreground"
+            onClick={() => setExpanded((prev) => !prev)}
+          >
+            {expanded ? "Show less" : "Show the full description"}
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function MergeRequestDetailView({
   project,
   iid,
@@ -1960,41 +3170,90 @@ function MergeRequestDetailView({
     load();
   }, [load]);
 
+  // Live status. GitLab moves on its own while a pipeline runs, while it
+  // re-checks mergeability, and for a while after any action here (a new
+  // pipeline takes seconds to attach), so the panel polls the cheap status
+  // read in those windows only, and never while the page is hidden.
+  const mrRef = useRef<MergeRequestDetail | null>(null);
+  mrRef.current = mr;
+  const pollUntil = useRef(0);
+  const afterAction = useCallback(() => {
+    pollUntil.current = Date.now() + 60_000;
+    load();
+  }, [load]);
+  const moving =
+    mr !== null &&
+    mr.state === "opened" &&
+    ((mr.pipeline !== null && PIPELINE_ACTIVE.has(mr.pipeline.status)) ||
+      MERGE_CHECKING.has(mr.mergeStatus) ||
+      mr.autoMerge);
+  const loaded = mr !== null;
+  useEffect(() => {
+    if (!loaded) return;
+    const timer = setInterval(() => {
+      if (document.hidden) return;
+      if (!moving && Date.now() > pollUntil.current) return;
+      rpc.call("getMergeRequestStatus", { project, iid }).then(
+        (status) => {
+          const current = mrRef.current;
+          if (current === null) return;
+          // New commits or a merge change the timeline and diffs too.
+          if (status.state !== current.state || status.sha !== current.sha) {
+            load();
+            return;
+          }
+          setMr((prev) => (prev === null ? prev : { ...prev, ...status }));
+        },
+        () => {
+          // A missed poll is retried on the next tick.
+        },
+      );
+    }, 10_000);
+    return () => clearInterval(timer);
+  }, [rpc, project, iid, load, loaded, moving]);
+
+  const updatePeople = useCallback(
+    (people: { reviewers?: string[]; assignees?: string[] }) => {
+      setMr((prev) => (prev === null ? prev : { ...prev, ...people }));
+      rpc.call("setMergeRequestPeople", { project, iid, ...people }).then(
+        (applied) =>
+          setMr((prev) =>
+            prev === null
+              ? prev
+              : {
+                  ...prev,
+                  reviewers: applied.reviewers,
+                  assignees: applied.assignees,
+                },
+          ),
+        (err: unknown) => {
+          toast.error(errorText(err));
+          load();
+        },
+      );
+    },
+    [rpc, project, iid, load],
+  );
+
   if (error !== null) return <EmptyState message={error} />;
   if (mr === null) return <DetailSkeleton />;
 
   const mrLinks = links[linkKey("mr", project, iid)];
   const mainColumn = (
     <div className="flex min-w-0 flex-1 flex-col gap-4">
-      <PipelineSection pipeline={mr.pipeline} jobs={mr.jobs} />
+      <MergeWidget mr={mr} onChanged={afterAction} />
 
-      <div className="overflow-hidden rounded-lg border border-border bg-card">
-        <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-4 py-2 text-xs text-muted-foreground">
-          <Avatar username={mr.author} />
-          <span className="font-medium text-foreground">{mr.author}</span>
-          opened this merge request · updated {relativeTime(mr.updatedAt)}
-        </div>
-        <div className="p-4">
-          {mr.body.length > 0 ? (
-            <Markdown content={mr.body} className="text-sm" />
-          ) : (
-            <p className="text-sm text-muted-foreground">(no description)</p>
-          )}
-        </div>
-      </div>
-
-      {mr.notes.length > 0 ? (
-        <div className="flex flex-col gap-2">
-          <h3 className="text-xs font-semibold text-muted-foreground">
-            Activity · {mr.notes.length}
-          </h3>
-          {mr.notes.map((note, index) => (
-            <NoteCard key={index} note={note} />
-          ))}
-        </div>
+      {compact ? (
+        <PeopleSection
+          mr={mr}
+          onPeople={updatePeople}
+          className="grid grid-cols-2 gap-4"
+        />
       ) : null}
 
-      <DiscussionsSection discussions={mr.discussions} />
+      <DescriptionCard mr={mr} compact={compact} />
+
+      <ActivitySection mr={mr} onChanged={load} />
 
       {mr.files.length > 0 ? (
         <div className="flex flex-col gap-2">
@@ -2082,11 +3341,6 @@ function MergeRequestDetailView({
             conflicts
           </Badge>
         ) : null}
-        {mr.mergeStatus.length > 0 ? (
-          <Badge variant="outline" className="font-normal">
-            {mr.mergeStatus.replace(/_/g, " ")}
-          </Badge>
-        ) : null}
         <span className="font-mono">
           {mr.sourceBranch} → {mr.targetBranch}
         </span>
@@ -2106,41 +3360,12 @@ function MergeRequestDetailView({
       </div>
 
       {compact ? (
-        <>
-          <div className="flex flex-col gap-1">
-            <SidebarHeading>Approvals</SidebarHeading>
-            <ApprovalsSummary mr={mr} />
-          </div>
-          {mainColumn}
-        </>
+        mainColumn
       ) : (
         <div className="flex flex-col gap-6 lg:flex-row">
           {mainColumn}
           <aside className="flex w-full shrink-0 flex-col gap-5 lg:w-56">
-            <div className="flex flex-col gap-1">
-              <SidebarHeading>Approvals</SidebarHeading>
-              <ApprovalsSummary mr={mr} />
-            </div>
-            <div className="flex flex-col gap-1">
-              <SidebarHeading>Reviewers</SidebarHeading>
-              {mr.reviewers.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No reviewers</p>
-              ) : (
-                mr.reviewers.map((username) => (
-                  <UserLine key={username} username={username} />
-                ))
-              )}
-            </div>
-            <div className="flex flex-col gap-1">
-              <SidebarHeading>Assignees</SidebarHeading>
-              {mr.assignees.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No one assigned</p>
-              ) : (
-                mr.assignees.map((username) => (
-                  <UserLine key={username} username={username} />
-                ))
-              )}
-            </div>
+            <PeopleSection mr={mr} onPeople={updatePeople} />
             <div className="flex flex-col gap-1.5">
               <SidebarHeading>Labels</SidebarHeading>
               {mr.labels.length === 0 ? (
