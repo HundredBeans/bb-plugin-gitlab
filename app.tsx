@@ -196,6 +196,8 @@ interface MergeRequestStatus {
   autoMerge: boolean;
   pipeline: Pipeline | null;
   jobs: Job[];
+  /** Moves whenever the conversation or the merge request itself changes. */
+  activityKey: string;
 }
 
 interface DiffFile {
@@ -1657,6 +1659,20 @@ const MERGE_CHECKING = new Set([
   "approvals_syncing",
 ]);
 
+/** Status poll cadence while something moves on its own, and otherwise. */
+const FAST_POLL_MS = 10_000;
+const IDLE_POLL_MS = 20_000;
+
+/** True while GitLab will change this merge request without anyone acting. */
+function isMoving(mr: MergeRequestStatus): boolean {
+  return (
+    mr.state === "opened" &&
+    ((mr.pipeline !== null && PIPELINE_ACTIVE.has(mr.pipeline.status)) ||
+      MERGE_CHECKING.has(mr.mergeStatus) ||
+      mr.autoMerge)
+  );
+}
+
 function jobDotClass(status: Job["status"]): string {
   if (status === "success") return "bg-primary";
   if (status === "failure") return "bg-destructive";
@@ -2577,16 +2593,29 @@ function DiffSnippet({
   );
 }
 
+// Half-written replies, by discussion id. An auto-update can remount a reply
+// box — a lone comment becomes a thread once someone else answers it — and
+// the text being typed must survive that.
+const replyDrafts = new Map<string, string>();
+
 function ReplyBox({
+  draftKey,
   onSubmit,
   placeholder = "Reply…",
 }: {
+  /** The discussion this reply goes to; keys the saved draft. */
+  draftKey: string;
   onSubmit: (body: string) => Promise<void>;
   placeholder?: string;
 }) {
-  const [open, setOpen] = useState(false);
-  const [body, setBody] = useState("");
+  const [body, setBodyState] = useState(() => replyDrafts.get(draftKey) ?? "");
+  const [open, setOpen] = useState(() => body.length > 0);
   const [posting, setPosting] = useState(false);
+  const setBody = (next: string) => {
+    setBodyState(next);
+    if (next.length > 0) replyDrafts.set(draftKey, next);
+    else replyDrafts.delete(draftKey);
+  };
   const submit = () => {
     if (body.trim().length === 0 || posting) return;
     setPosting(true);
@@ -2802,7 +2831,10 @@ function ThreadCard({
                 ))}
               </div>
             ) : null}
-            <ReplyBox onSubmit={(body) => onReply(entry.id, body)} />
+            <ReplyBox
+              draftKey={entry.id}
+              onSubmit={(body) => onReply(entry.id, body)}
+            />
           </div>
         </>
       )}
@@ -2821,7 +2853,10 @@ function CommentEntry({
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
       <NoteBody note={note} />
-      <ReplyBox onSubmit={(body) => onReply(entry.id, body)} />
+      <ReplyBox
+        draftKey={entry.id}
+        onSubmit={(body) => onReply(entry.id, body)}
+      />
     </div>
   );
 }
@@ -3155,62 +3190,118 @@ function MergeRequestDetailView({
   const { spawn, spawningKey } = useSpawn();
   const [mr, setMr] = useState<MergeRequestDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const mrRef = useRef<MergeRequestDetail | null>(null);
+  mrRef.current = mr;
+  // When GitLab last answered, and why it stopped answering, for the
+  // "Auto-updating" line in the header.
+  const [checkedAt, setCheckedAt] = useState<number | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const loading = useRef(false);
 
-  const load = useCallback(() => {
-    rpc.call("getMergeRequest", { project, iid }).then(
-      (result) => {
-        setMr(result.mergeRequest);
-        setError(null);
-      },
-      (err: unknown) => setError(errorText(err)),
-    );
+  const load = useCallback((): Promise<void> => {
+    loading.current = true;
+    return rpc
+      .call("getMergeRequest", { project, iid })
+      .then(
+        (result) => {
+          setMr(result.mergeRequest);
+          setError(null);
+          setRefreshError(null);
+          setCheckedAt(Date.now());
+        },
+        (err: unknown) => {
+          // With a view on screen a failed reload keeps it and says so in
+          // the header (a VPN blip must not blank the panel); only a first
+          // load with nothing to show becomes the error screen.
+          if (mrRef.current === null) setError(errorText(err));
+          else setRefreshError(errorText(err));
+        },
+      )
+      .finally(() => {
+        loading.current = false;
+      });
   }, [rpc, project, iid]);
   useEffect(() => {
     setMr(null);
-    load();
+    setCheckedAt(null);
+    void load();
   }, [load]);
 
-  // Live status. GitLab moves on its own while a pipeline runs, while it
-  // re-checks mergeability, and for a while after any action here (a new
-  // pipeline takes seconds to attach), so the panel polls the cheap status
-  // read in those windows only, and never while the page is hidden.
-  const mrRef = useRef<MergeRequestDetail | null>(null);
-  mrRef.current = mr;
+  const refreshNow = useCallback(() => {
+    setRefreshing(true);
+    void load().finally(() => setRefreshing(false));
+  }, [load]);
+
+  // Auto-update. The panel polls the cheap status read the whole time it is
+  // open: every FAST_POLL_MS while something moves on its own (a running
+  // pipeline, GitLab re-checking mergeability, auto-merge) or for a minute
+  // after an action here (a new pipeline takes seconds to attach), else
+  // every IDLE_POLL_MS. The status carries an activity stamp; when it, the
+  // state, or the head commit changes, the whole view reloads — that is how
+  // new comments, replies, resolves, approvals, and people show up. Nothing
+  // runs while the page is hidden, and coming back checks at once.
   const pollUntil = useRef(0);
+  const pokePoll = useRef<(delay: number) => void>(() => {});
   const afterAction = useCallback(() => {
     pollUntil.current = Date.now() + 60_000;
-    load();
+    void load();
+    pokePoll.current(FAST_POLL_MS);
   }, [load]);
-  const moving =
-    mr !== null &&
-    mr.state === "opened" &&
-    ((mr.pipeline !== null && PIPELINE_ACTIVE.has(mr.pipeline.status)) ||
-      MERGE_CHECKING.has(mr.mergeStatus) ||
-      mr.autoMerge);
   const loaded = mr !== null;
   useEffect(() => {
     if (!loaded) return;
-    const timer = setInterval(() => {
-      if (document.hidden) return;
-      if (!moving && Date.now() > pollUntil.current) return;
-      rpc.call("getMergeRequestStatus", { project, iid }).then(
-        (status) => {
-          const current = mrRef.current;
-          if (current === null) return;
-          // New commits or a merge change the timeline and diffs too.
-          if (status.state !== current.state || status.sha !== current.sha) {
-            load();
-            return;
-          }
-          setMr((prev) => (prev === null ? prev : { ...prev, ...status }));
-        },
-        () => {
-          // A missed poll is retried on the next tick.
-        },
-      );
-    }, 10_000);
-    return () => clearInterval(timer);
-  }, [rpc, project, iid, load, loaded, moving]);
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = (delay?: number) => {
+      if (stopped) return;
+      clearTimeout(timer);
+      const current = mrRef.current;
+      const fast =
+        (current !== null && isMoving(current)) ||
+        Date.now() < pollUntil.current;
+      timer = setTimeout(tick, delay ?? (fast ? FAST_POLL_MS : IDLE_POLL_MS));
+    };
+    const tick = () => {
+      // A reload in flight already brings everything the poll would.
+      if (document.hidden || loading.current) {
+        schedule();
+        return;
+      }
+      rpc
+        .call("getMergeRequestStatus", { project, iid })
+        .then(
+          (status) => {
+            const current = mrRef.current;
+            if (stopped || current === null) return;
+            if (
+              status.state !== current.state ||
+              status.sha !== current.sha ||
+              status.activityKey !== current.activityKey
+            ) {
+              return load();
+            }
+            setMr((prev) => (prev === null ? prev : { ...prev, ...status }));
+            setRefreshError(null);
+            setCheckedAt(Date.now());
+          },
+          (err: unknown) => setRefreshError(errorText(err)),
+        )
+        .finally(() => schedule());
+    };
+    const onVisibility = () => {
+      if (!document.hidden) schedule(0);
+    };
+    pokePoll.current = (delay) => schedule(delay);
+    document.addEventListener("visibilitychange", onVisibility);
+    schedule();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+      pokePoll.current = () => {};
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [rpc, project, iid, load, loaded]);
 
   const updatePeople = useCallback(
     (people: { reviewers?: string[]; assignees?: string[] }) => {
@@ -3228,7 +3319,7 @@ function MergeRequestDetailView({
           ),
         (err: unknown) => {
           toast.error(errorText(err));
-          load();
+          void load();
         },
       );
     },
@@ -3308,6 +3399,32 @@ function MergeRequestDetailView({
           {project} · !{iid}
         </span>
         <span className="flex-1" />
+        <span
+          className={`flex shrink-0 items-center gap-1 ${refreshError !== null ? "text-destructive" : ""}`}
+          title={
+            refreshError !== null
+              ? `Could not reach GitLab: ${refreshError}`
+              : `Updates on its own while open${
+                  checkedAt !== null
+                    ? ` · last checked ${new Date(checkedAt).toLocaleTimeString()}`
+                    : ""
+                }`
+          }
+        >
+          <span
+            className={`size-1.5 rounded-full ${refreshError !== null ? "bg-destructive" : "bg-primary"}`}
+          />
+          {refreshError !== null ? "Not updating" : "Auto-updating"}
+        </span>
+        <button
+          className="shrink-0 rounded p-1 hover:bg-accent hover:text-foreground"
+          onClick={refreshNow}
+          disabled={refreshing}
+          aria-label="Refresh now"
+          title="Refresh now"
+        >
+          <RefreshIcon className={refreshing ? "animate-spin" : undefined} />
+        </button>
         <a
           href={mr.url}
           target="_blank"
@@ -3443,6 +3560,9 @@ function MergeRequestPickerList({
   );
 }
 
+/** How often a thread with no merge request yet looks for one again. */
+const THREAD_MR_RETRY_MS = 30_000;
+
 function MergeRequestPanelTab({ threadId }: PluginThreadPanelProps) {
   const rpc = useRpc<typeof gitlabRpcContract>();
   const [resolved, setResolved] = useState(false);
@@ -3450,8 +3570,14 @@ function MergeRequestPanelTab({ threadId }: PluginThreadPanelProps) {
     project: string;
     iid: number;
   } | null>(null);
+  // Set once the viewer picks from the list or goes back to it: from then on
+  // the panel shows what they chose and stops looking on its own.
+  const [viewerChose, setViewerChose] = useState(false);
 
   useEffect(() => {
+    setResolved(false);
+    setSelected(null);
+    setViewerChose(false);
     let cancelled = false;
     rpc.call("mergeRequestForThread", { threadId }).then(
       (result) => {
@@ -3468,15 +3594,45 @@ function MergeRequestPanelTab({ threadId }: PluginThreadPanelProps) {
     };
   }, [rpc, threadId]);
 
+  // A thread often gets its merge request after the panel opened — an agent
+  // pushes and opens one — so while there is none, keep looking.
+  const waiting = resolved && selected === null && !viewerChose;
+  useEffect(() => {
+    if (!waiting) return;
+    let cancelled = false;
+    const timer = setInterval(() => {
+      if (document.hidden) return;
+      rpc.call("mergeRequestForThread", { threadId }).then(
+        (result) => {
+          if (!cancelled && result.mergeRequest !== null) {
+            setSelected(result.mergeRequest);
+          }
+        },
+        () => {
+          // Tried again on the next tick.
+        },
+      );
+    }, THREAD_MR_RETRY_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [rpc, threadId, waiting]);
+
   if (!resolved) return <DetailSkeleton />;
   if (selected === null) {
     return (
       <div className="flex flex-col gap-3">
         <p className="text-xs text-muted-foreground">
-          No merge request is linked to this thread yet — pick one:
+          {viewerChose
+            ? "Pick a merge request:"
+            : "No merge request is linked to this thread yet. This panel switches to it on its own once one exists, or pick one:"}
         </p>
         <MergeRequestPickerList
-          onPick={(project, iid) => setSelected({ project, iid })}
+          onPick={(project, iid) => {
+            setViewerChose(true);
+            setSelected({ project, iid });
+          }}
         />
       </div>
     );
@@ -3487,7 +3643,10 @@ function MergeRequestPanelTab({ threadId }: PluginThreadPanelProps) {
       iid={selected.iid}
       compact
       backLabel="All merge requests"
-      onBack={() => setSelected(null)}
+      onBack={() => {
+        setViewerChose(true);
+        setSelected(null);
+      }}
     />
   );
 }

@@ -194,6 +194,11 @@ const mergeRequestStatusSchema = z
     autoMerge: z.boolean(),
     pipeline: pipelineSchema.nullable(),
     jobs: z.array(jobSchema),
+    /**
+     * Changes whenever the conversation or the merge request itself does —
+     * see activityKey — so a status poll can tell the panel to reload.
+     */
+    activityKey: z.string(),
   })
   .strict();
 const mergeRequestSchema = mergeRequestStatusSchema
@@ -604,6 +609,15 @@ const gitlabProjectSettingsSchema = z
     remove_source_branch_after_merge: z.boolean().catch(false),
   })
   .catch({ squash_option: "default_off", remove_source_branch_after_merge: false });
+/** Just enough of a note to tell whether anything changed since. */
+const gitlabNoteStampListSchema = z
+  .array(
+    z.looseObject({
+      id: z.number().int().catch(0),
+      updated_at: z.string().catch(""),
+    }),
+  )
+  .catch([]);
 const gitlabRepositoryFileSchema = z.looseObject({
   size: z.number().int().nonnegative().catch(0),
   encoding: z.string().catch("base64"),
@@ -962,6 +976,29 @@ export function toTimeline(raw: unknown): TimelineEntry[] {
         a.index - b.index,
     )
     .map(({ entry }) => entry);
+}
+
+/**
+ * A fingerprint of everything the detail view shows beyond the moving
+ * status: the merge request's own `updated_at` (title, description, labels,
+ * people, a new head pipeline) and its most recently updated note. Nearly
+ * every other change writes a note: a comment or reply, an approval or its
+ * revoke, pushed commits, a review request, a merge. Resolving a thread
+ * updates the resolved notes' `updated_at`, so it shows up here too.
+ *
+ * `latestNotes` is GitLab's `notes?sort=desc&order_by=updated_at&per_page=1`;
+ * when that call failed the key still moves with the merge request.
+ */
+export function activityKey(
+  mergeRequestUpdatedAt: string,
+  latestNotes: unknown,
+): string {
+  const [latest] = gitlabNoteStampListSchema.parse(latestNotes);
+  return [
+    mergeRequestUpdatedAt,
+    latest?.id ?? 0,
+    latest?.updated_at ?? "",
+  ].join("|");
 }
 
 /**
@@ -1883,10 +1920,70 @@ export default async function plugin(bb: BbPluginApi) {
       }));
   }
 
+  /**
+   * A call whose failure should degrade one section, not the whole view:
+   * logged, and read as undefined (which the payload schemas catch).
+   */
+  async function optionalGitlabApi(
+    project: string,
+    endpoint: string,
+  ): Promise<unknown> {
+    try {
+      return await gitlabApi(project, endpoint);
+    } catch (error) {
+      bb.log.warn(
+        `optional call ${endpoint} failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return undefined;
+    }
+  }
+
+  /** GitLab's most recently updated note on a merge request, for activityKey. */
+  function latestNoteEndpoint(project: string, iid: number): string {
+    return `${mergeRequestPath(project, iid)}/notes?sort=desc&order_by=updated_at&per_page=1`;
+  }
+
+  /**
+   * Bring the cached list row in line with what a detail read just saw, so
+   * the list agrees with the open merge request before the next sync. Only
+   * a real difference writes (and so pings the list to refetch).
+   */
+  function syncCachedMergeRequest(
+    project: string,
+    iid: number,
+    seen: {
+      state: string;
+      assignees?: string[];
+      reviewers?: string[];
+      labels?: string[];
+    },
+  ): void {
+    const cached = getCachedItem("mr", project, iid);
+    if (cached === null) return;
+    const same = (a: string[], b: string[] | undefined) =>
+      b === undefined || JSON.stringify(a) === JSON.stringify(b);
+    const patch = {
+      ...(cached.state !== seen.state ? { state: seen.state } : {}),
+      ...(same(cached.assignees, seen.assignees)
+        ? {}
+        : { assignees: seen.assignees }),
+      ...(same(cached.reviewers, seen.reviewers)
+        ? {}
+        : { reviewers: seen.reviewers }),
+      ...(same(cached.labels, seen.labels) ? {} : { labels: seen.labels }),
+    };
+    if (Object.keys(patch).length > 0) {
+      patchCachedItem("mr", project, iid, patch);
+    }
+  }
+
   /** The moving parts of a merge request, from its detail row. */
   async function toMergeRequestStatus(
     project: string,
     detail: z.infer<typeof gitlabMergeRequestRowSchema>,
+    latestNotes: unknown,
   ): Promise<z.infer<typeof mergeRequestStatusSchema>> {
     const pipeline =
       detail.head_pipeline?.id != null && detail.head_pipeline.id > 0
@@ -1905,6 +2002,7 @@ export default async function plugin(bb: BbPluginApi) {
       autoMerge: detail.merge_when_pipeline_succeeds,
       pipeline,
       jobs: await loadJobs(project, pipeline?.id ?? null),
+      activityKey: activityKey(detail.updated_at, latestNotes),
     };
   }
 
@@ -2221,18 +2319,16 @@ export default async function plugin(bb: BbPluginApi) {
      */
     async getMergeRequest({ project, iid }) {
       const base = mergeRequestPath(project, iid);
-      const optional = async (endpoint: string): Promise<unknown> => {
-        try {
-          return await gitlabApi(project, endpoint);
-        } catch (error) {
-          bb.log.warn(
-            `optional call ${endpoint} failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-          return undefined;
-        }
-      };
+      const optional = (endpoint: string) =>
+        optionalGitlabApi(project, endpoint);
+      // The activity stamp (this row's updated_at and the latest note) is
+      // read before anything it vouches for. A change landing in between
+      // then shows in the view but not in the stamp, which costs one extra
+      // reload on the next poll; the other order would hide it for good.
+      const [detailRaw, latestNotes] = await Promise.all([
+        gitlabApi(project, base),
+        optional(latestNoteEndpoint(project, iid)),
+      ]);
       // The timeline is the conversation itself, so a failure is reported
       // in the view rather than passed off as "no comments yet".
       const timelineRead = gitlabApiPages(
@@ -2246,16 +2342,21 @@ export default async function plugin(bb: BbPluginApi) {
           timelineError: error instanceof Error ? error.message : String(error),
         }),
       );
-      const [detailRaw, diffsRaw, approvalsRaw, settings, timelineResult] =
+      const [diffsRaw, approvalsRaw, settings, timelineResult] =
         await Promise.all([
-          gitlabApi(project, base),
           optional(`${base}/diffs?per_page=${DIFF_PAGE}`),
           optional(`${base}/approvals`),
           getProjectSettings(project),
           timelineRead,
         ]);
       const detail = gitlabMergeRequestRowSchema.parse(detailRaw);
-      const status = await toMergeRequestStatus(project, detail);
+      const status = await toMergeRequestStatus(project, detail, latestNotes);
+      syncCachedMergeRequest(project, iid, {
+        state: detail.state,
+        assignees: usernames(detail.assignees),
+        reviewers: usernames(detail.reviewers),
+        labels: detail.labels,
+      });
 
       let additions = 0;
       let deletions = 0;
@@ -2346,14 +2447,18 @@ export default async function plugin(bb: BbPluginApi) {
 
     /**
      * { project, iid } → the parts that move while a merge request is open:
-     * state, merge status, pipeline, jobs. Two API calls, cheap enough for
-     * the panel to poll while a pipeline runs.
+     * state, merge status, pipeline, jobs, plus the activity stamp that
+     * tells the panel when the rest needs a reload. Three small API calls,
+     * cheap enough for the panel to poll the whole time it is open.
      */
     async getMergeRequestStatus({ project, iid }) {
-      const detail = gitlabMergeRequestRowSchema.parse(
-        await gitlabApi(project, mergeRequestPath(project, iid)),
-      );
-      return await toMergeRequestStatus(project, detail);
+      const [detailRaw, latestNotes] = await Promise.all([
+        gitlabApi(project, mergeRequestPath(project, iid)),
+        optionalGitlabApi(project, latestNoteEndpoint(project, iid)),
+      ]);
+      const detail = gitlabMergeRequestRowSchema.parse(detailRaw);
+      syncCachedMergeRequest(project, iid, { state: detail.state });
+      return await toMergeRequestStatus(project, detail, latestNotes);
     },
 
     /**

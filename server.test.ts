@@ -3,6 +3,7 @@ import { defineRpcContract } from "@get-bb/plugin-sdk";
 import type { PluginRpcClient, PluginRpcHandlers } from "@get-bb/plugin-sdk";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import {
+  activityKey,
   classifyJob,
   classifyJobStatus,
   countDiffLines,
@@ -545,6 +546,42 @@ describe("merge-request timeline", () => {
     expect(sliceSnippet(text, 99, 99).lines.at(-1)).toBe("line 20");
     // A trailing newline is not an extra empty line.
     expect(sliceSnippet("a\nb\n", 2, 2).lines).toEqual(["a", "b"]);
+  });
+
+  it("moves the activity stamp on every change the panel must reload for", () => {
+    const at = "2026-09-24T03:01:30.260-04:00";
+    const note = (id: number, updated: string) => [
+      { id, updated_at: updated, body: "x" },
+    ];
+    const base = activityKey(at, note(7, "2026-09-24T03:01:36.124-04:00"));
+    // The same answer twice is the same key: no reload.
+    expect(activityKey(at, note(7, "2026-09-24T03:01:36.124-04:00"))).toBe(
+      base,
+    );
+    // A new comment, reply, approval, or pushed commit is a newer note.
+    expect(activityKey(at, note(8, "2026-09-24T03:05:00.000-04:00"))).not.toBe(
+      base,
+    );
+    // Resolving a thread keeps the note but moves its updated_at.
+    expect(activityKey(at, note(7, "2026-09-24T03:09:00.000-04:00"))).not.toBe(
+      base,
+    );
+    // A title, description, label, or people change moves the row itself.
+    expect(
+      activityKey(
+        "2026-09-24T03:10:00.000-04:00",
+        note(7, "2026-09-24T03:01:36.124-04:00"),
+      ),
+    ).not.toBe(base);
+  });
+
+  it("keeps a stable activity stamp when the notes call failed", () => {
+    const at = "2026-09-24T03:01:30.260-04:00";
+    expect(activityKey(at, undefined)).toBe(activityKey(at, undefined));
+    expect(activityKey(at, "not a list")).toBe(activityKey(at, []));
+    expect(activityKey("2026-09-25T00:00:00Z", undefined)).not.toBe(
+      activityKey(at, undefined),
+    );
   });
 
   it("caps a very long range", () => {

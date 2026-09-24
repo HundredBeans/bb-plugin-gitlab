@@ -58,12 +58,23 @@ thread links survive it.
     line, and the code it is about, read from the commit it was written
     against. Reply to any comment or thread, resolve or reopen threads, and
     filter by All / Comments / Unresolved. Resolved threads start folded.
-  - **Live status** — while a pipeline runs, while GitLab re-checks
-    mergeability, and for a minute after any action, the view polls a cheap
-    status read every 10 seconds (never while the page is hidden).
+  - **Auto-update** — the open view polls a cheap status read (three small
+    API calls) every 10 seconds while something moves on its own (a running
+    pipeline, GitLab re-checking mergeability, auto-merge) or for a minute
+    after an action, else every 20 seconds; never while the page is hidden,
+    and at once when it comes back. The status carries an activity stamp —
+    the merge request's `updated_at` plus its most recently updated note —
+    and when that changes the whole view reloads, so new comments, replies,
+    resolves, approvals, pushed commits, and people changes show up on their
+    own. A failed refresh keeps what is on screen and says "Not updating"
+    in the header, next to a refresh-now button. A reply being typed
+    survives a reload, and the list row is brought in line with what the
+    detail view saw.
 - **Thread side panel** ("Merge request" in a thread's right panel): the same
   merge-request view, single column, resolved to the thread's own merge
-  request through its branch.
+  request through its branch. While the thread has none yet, the panel
+  looks again every 30 seconds and switches to it once it exists, unless
+  you picked one yourself.
 - **Send agent / Review with agent**: spawns a BB worker thread on the issue (or
   a review thread on the merge request) in the matching BB project. The item
   then shows a ⚡ pill linking to the thread.
