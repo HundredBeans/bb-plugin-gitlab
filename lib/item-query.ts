@@ -21,6 +21,8 @@ export interface QueryableItem {
   author: string;
   labels: string[];
   assignees: string[];
+  /** Merge requests only: GitLab has no reviewers on an issue. */
+  reviewers: string[];
 }
 
 export interface ParsedItemQuery {
@@ -28,10 +30,12 @@ export interface ParsedItemQuery {
   /** True when `is:draft` asked for drafts only. */
   draftOnly: boolean;
   assignees: string[];
+  reviewers: string[];
   authors: string[];
   labels: string[];
   projects: string[];
   noAssignee: boolean;
+  noReviewer: boolean;
   noLabel: boolean;
   text: string[];
 }
@@ -60,10 +64,12 @@ export function parseItemQuery(query: string): ParsedItemQuery {
     states: [],
     draftOnly: false,
     assignees: [],
+    reviewers: [],
     authors: [],
     labels: [],
     projects: [],
     noAssignee: false,
+    noReviewer: false,
     noLabel: false,
     text: [],
   };
@@ -79,6 +85,8 @@ export function parseItemQuery(query: string): ParsedItemQuery {
       else parsed.states.push(STATE_WORDS[word] ?? word);
     } else if (key === "assignee") {
       parsed.assignees.push(value.toLowerCase());
+    } else if (key === "reviewer") {
+      parsed.reviewers.push(value.toLowerCase());
     } else if (key === "author") {
       parsed.authors.push(value.toLowerCase());
     } else if (key === "label") {
@@ -88,6 +96,7 @@ export function parseItemQuery(query: string): ParsedItemQuery {
     } else if (key === "no") {
       const word = value.toLowerCase();
       if (word === "assignee") parsed.noAssignee = true;
+      if (word === "reviewer") parsed.noReviewer = true;
       if (word === "label") parsed.noLabel = true;
     } else {
       parsed.text.push(unquote(token).toLowerCase());
@@ -122,6 +131,16 @@ export function matchesItemQuery(
       return false;
     }
   }
+  // An issue carries no reviewers, so `reviewer:` narrows the Issues tab to
+  // nothing. That is the honest answer: GitLab has no such field to match.
+  if (query.reviewers.length > 0) {
+    const wanted = resolveLogins(query.reviewers, viewer);
+    if (
+      !item.reviewers.some((login) => wanted.includes(login.toLowerCase()))
+    ) {
+      return false;
+    }
+  }
   if (query.authors.length > 0) {
     const wanted = resolveLogins(query.authors, viewer);
     if (!wanted.includes(item.author.toLowerCase())) return false;
@@ -137,6 +156,7 @@ export function matchesItemQuery(
     return false;
   }
   if (query.noAssignee && item.assignees.length > 0) return false;
+  if (query.noReviewer && item.reviewers.length > 0) return false;
   if (query.noLabel && item.labels.length > 0) return false;
   if (query.text.length > 0) {
     const haystack =
@@ -146,13 +166,19 @@ export function matchesItemQuery(
   return true;
 }
 
-export const QUALIFIER_KEYS: { key: string; hint: string }[] = [
+export const QUALIFIER_KEYS: {
+  key: string;
+  hint: string;
+  /** Offered on the Merge requests tab only; an issue has no such field. */
+  mrOnly?: boolean;
+}[] = [
   { key: "is:", hint: "state — open, closed, merged, draft" },
   { key: "assignee:", hint: "assigned user, or @me" },
+  { key: "reviewer:", hint: "review requested from, or @me", mrOnly: true },
   { key: "author:", hint: "opened by" },
   { key: "label:", hint: "has label" },
   { key: "project:", hint: "in project" },
-  { key: "no:", hint: "missing — assignee, label" },
+  { key: "no:", hint: "missing — assignee, reviewer, label" },
 ];
 
 /** The words the panel can complete, harvested from the loaded items. */
@@ -189,9 +215,15 @@ export function suggestQueryTokens(
   const idx = token.indexOf(":");
   if (idx <= 0) {
     const prefix = token.toLowerCase();
-    return QUALIFIER_KEYS.filter((entry) => entry.key.startsWith(prefix)).map(
-      (entry) => ({ insert: entry.key, label: entry.key, hint: entry.hint }),
-    );
+    return QUALIFIER_KEYS.filter(
+      (entry) =>
+        entry.key.startsWith(prefix) &&
+        (entry.mrOnly !== true || kind === "mr"),
+    ).map((entry) => ({
+      insert: entry.key,
+      label: entry.key,
+      hint: entry.hint,
+    }));
   }
   const key = token.slice(0, idx).toLowerCase();
   const partial = unquote(token.slice(idx + 1)).toLowerCase();
@@ -208,7 +240,7 @@ export function suggestQueryTokens(
       draft: word === "draft",
     }));
   }
-  if (key === "assignee" || key === "author") {
+  if (key === "assignee" || key === "author" || key === "reviewer") {
     return ["@me", ...vocab.users].filter(matches).map((login) => ({
       insert: `${key}:${login} `,
       label: login === "@me" && viewer !== null ? `@me (${viewer})` : login,
@@ -228,12 +260,48 @@ export function suggestQueryTokens(
     }));
   }
   if (key === "no") {
-    return ["assignee", "label"].filter(matches).map((field) => ({
+    const fields =
+      kind === "mr" ? ["assignee", "reviewer", "label"] : ["assignee", "label"];
+    return fields.filter(matches).map((field) => ({
       insert: `${key}:${field} `,
       label: `no:${field}`,
     }));
   }
   return [];
+}
+
+/**
+ * The query narrowed to one project, or widened to all of them when `project`
+ * is null. Written for a project picker that sits beside the filter box: the
+ * query text stays the single source of truth, so a project chosen in the
+ * picker and one typed by hand cannot disagree.
+ *
+ * The first `project:` token is replaced where it stands, so the box does not
+ * reshuffle under the caret; any further ones are dropped, because the picker
+ * offers one project and two would read as "either".
+ */
+export function withQueryProject(
+  query: string,
+  project: string | null,
+): string {
+  const replacement =
+    project === null ? null : `project:${quoteValue(project)}`;
+  const kept: string[] = [];
+  let placed = false;
+  for (const token of query.match(TOKEN) ?? []) {
+    const idx = token.indexOf(":");
+    if (idx <= 0 || token.slice(0, idx).toLowerCase() !== "project") {
+      kept.push(token);
+      continue;
+    }
+    if (placed || replacement === null) continue;
+    kept.push(replacement);
+    placed = true;
+  }
+  if (!placed && replacement !== null) kept.push(replacement);
+  // The trailing space leaves the caret on a fresh token, the same shape the
+  // completions insert.
+  return kept.length === 0 ? "" : `${kept.join(" ")} `;
 }
 
 /** The first `project:` value that names a tracked project, for form defaults. */

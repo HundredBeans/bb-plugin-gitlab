@@ -4,6 +4,7 @@ import {
   parseItemQuery,
   queryProject,
   suggestQueryTokens,
+  withQueryProject,
   type QueryableItem,
 } from "./item-query";
 
@@ -17,6 +18,7 @@ const ISSUE: QueryableItem = {
   author: "dana",
   labels: ["bug", "needs triage"],
   assignees: ["Rio"],
+  reviewers: [],
 };
 
 const MR: QueryableItem = {
@@ -29,6 +31,7 @@ const MR: QueryableItem = {
   author: "rio",
   labels: [],
   assignees: [],
+  reviewers: ["Dana"],
 };
 
 const match = (query: string, item: QueryableItem, viewer: string | null = null) =>
@@ -64,6 +67,12 @@ describe("parseItemQuery", () => {
 
   it("treats unqualified words as text terms", () => {
     expect(parseItemQuery("login TIMEOUT").text).toEqual(["login", "timeout"]);
+  });
+
+  it("collects reviewer: separately from assignee:", () => {
+    const parsed = parseItemQuery("reviewer:Dana assignee:rio");
+    expect(parsed.reviewers).toEqual(["dana"]);
+    expect(parsed.assignees).toEqual(["rio"]);
   });
 });
 
@@ -106,6 +115,26 @@ describe("matchesItemQuery", () => {
     expect(match("no:assignee", ISSUE)).toBe(false);
     expect(match("no:label", MR)).toBe(true);
     expect(match("no:label", ISSUE)).toBe(false);
+  });
+
+  it("filters on the reviewer, case-insensitively and against @me", () => {
+    expect(match("reviewer:dana", MR)).toBe(true);
+    expect(match("reviewer:rio", MR)).toBe(false);
+    expect(match("reviewer:@me", MR, "dana")).toBe(true);
+    expect(match("reviewer:@me", MR, "rio")).toBe(false);
+  });
+
+  it("keeps reviewer: and assignee: apart", () => {
+    // MR is reviewed by Dana and assigned to nobody.
+    expect(match("assignee:dana", MR)).toBe(false);
+    expect(match("reviewer:dana no:assignee", MR)).toBe(true);
+  });
+
+  it("matches no issue on reviewer: — GitLab has no such field there", () => {
+    expect(match("reviewer:rio", ISSUE)).toBe(false);
+    expect(match("reviewer:@me", ISSUE, "dana")).toBe(false);
+    expect(match("no:reviewer", ISSUE)).toBe(true);
+    expect(match("no:reviewer", MR)).toBe(false);
   });
 });
 
@@ -152,6 +181,66 @@ describe("suggestQueryTokens", () => {
     expect(
       suggestQueryTokens("author:ri", vocab, "issue", null).map((s) => s.label),
     ).toEqual(["rio"]);
+  });
+
+  it("offers reviewer: on merge requests only", () => {
+    expect(
+      suggestQueryTokens("re", vocab, "mr", null).map((s) => s.insert),
+    ).toEqual(["reviewer:"]);
+    expect(suggestQueryTokens("re", vocab, "issue", null)).toEqual([]);
+  });
+
+  it("completes a reviewer the same way as an assignee", () => {
+    const [me] = suggestQueryTokens("reviewer:", vocab, "mr", "dana");
+    expect(me).toMatchObject({
+      insert: "reviewer:@me ",
+      label: "@me (dana)",
+      username: "dana",
+    });
+  });
+
+  it("offers no:reviewer on merge requests only", () => {
+    expect(suggestQueryTokens("no:", vocab, "mr", null).map((s) => s.label)).toEqual(
+      ["no:assignee", "no:reviewer", "no:label"],
+    );
+    expect(
+      suggestQueryTokens("no:", vocab, "issue", null).map((s) => s.label),
+    ).toEqual(["no:assignee", "no:label"]);
+  });
+});
+
+describe("withQueryProject", () => {
+  it("replaces the project where it stands, keeping the other qualifiers", () => {
+    expect(
+      withQueryProject("is:open project:gitlab.com/acme/web author:@me", "x.dev/a/b"),
+    ).toBe("is:open project:x.dev/a/b author:@me ");
+  });
+
+  it("appends the project when the query has none", () => {
+    expect(withQueryProject("is:open ", "x.dev/a/b")).toBe(
+      "is:open project:x.dev/a/b ",
+    );
+    expect(withQueryProject("", "x.dev/a/b")).toBe("project:x.dev/a/b ");
+  });
+
+  it("drops every project token when widened to all projects", () => {
+    expect(
+      withQueryProject("project:a.dev/a/b is:open project:c.dev/c/d", null),
+    ).toBe("is:open ");
+    expect(withQueryProject("project:a.dev/a/b", null)).toBe("");
+  });
+
+  it("keeps one project when the query named several", () => {
+    expect(
+      withQueryProject("project:a.dev/a/b project:c.dev/c/d", "x.dev/a/b"),
+    ).toBe("project:x.dev/a/b ");
+  });
+
+  it("round-trips through the parser", () => {
+    const next = withQueryProject("is:open", "gitlab.com/acme/web");
+    expect(queryProject(parseItemQuery(next), ["gitlab.com/acme/web"])).toBe(
+      "gitlab.com/acme/web",
+    );
   });
 });
 

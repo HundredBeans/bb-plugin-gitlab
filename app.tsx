@@ -70,6 +70,7 @@ import {
   QUALIFIER_KEYS,
   queryProject,
   suggestQueryTokens,
+  withQueryProject,
   type Kind,
   type ParsedItemQuery,
   type QuerySuggestion,
@@ -100,6 +101,8 @@ interface Item {
   author: string;
   labels: string[];
   assignees: string[];
+  /** Empty for every issue — GitLab has no reviewers on one. */
+  reviewers: string[];
   url: string;
   body: string;
   updatedAt: string;
@@ -270,7 +273,10 @@ function parseSubPath(subPath: string): Route {
       ? { view: "issues" }
       : { view: "issue", project: item.project, iid: item.iid };
   }
-  return { view: "issues" };
+  // Opening the page with no sub-path lands on merge requests: the panel is
+  // read far more often to see what is waiting for review than to browse
+  // issues. `issues` in the sub-path still goes straight there.
+  return { view: "merge_requests" };
 }
 
 function routeToSubPath(route: Route): string {
@@ -726,6 +732,7 @@ function FilterBar({
     for (const item of items ?? []) {
       if (item.author.length > 0) users.add(item.author);
       for (const username of item.assignees) users.add(username);
+      for (const username of item.reviewers) users.add(username);
       for (const label of item.labels) labels.add(label);
     }
     return {
@@ -2391,6 +2398,62 @@ function PanelHeader() {
 const QUERY_KEY = "bb-plugin-gitlab:query";
 const DEFAULT_QUERY = "is:open ";
 
+/** Radix rejects "" as an item value, so "all projects" needs a name. */
+const ALL_PROJECTS = "__all__";
+
+/**
+ * Project picker beside the tabs. It reads and writes the `project:` qualifier
+ * rather than holding a project of its own, so it agrees with a project typed
+ * into the filter box, and it persists for free with the rest of the query.
+ *
+ * A project the query names but this host does not track reads as "All
+ * projects": the picker can only offer what it has, and pretending otherwise
+ * would silently drop the user's own filter on the next change.
+ */
+function ProjectPicker({
+  projects,
+  query,
+  onQuery,
+}: {
+  projects: ProjectInfo[];
+  query: string;
+  onQuery: (query: string) => void;
+}) {
+  const refs = useMemo(
+    () => projects.map((entry) => entry.project),
+    [projects],
+  );
+  const selected = useMemo(
+    () => queryProject(parseItemQuery(query), refs),
+    [query, refs],
+  );
+  if (projects.length < 2) return null;
+  return (
+    <Select
+      value={selected ?? ALL_PROJECTS}
+      onValueChange={(value) =>
+        onQuery(withQueryProject(query, value === ALL_PROJECTS ? null : value))
+      }
+    >
+      <SelectTrigger
+        className="h-8 w-36 text-sm sm:w-52"
+        aria-label="Project"
+        title={selected ?? "All projects"}
+      >
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={ALL_PROJECTS}>All projects</SelectItem>
+        {projects.map((entry) => (
+          <SelectItem key={entry.project} value={entry.project}>
+            <span title={entry.project}>{shortProject(entry.project)}</span>
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
 function ListView({
   kind,
   projects,
@@ -2569,6 +2632,11 @@ function GitlabRoutedBody({
             <TabsTrigger value="merge_requests">Merge requests</TabsTrigger>
           </TabsList>
         </Tabs>
+        <ProjectPicker
+          projects={projects}
+          query={query}
+          onQuery={onQuery}
+        />
         <div className="flex-1" />
         {route.view === "issues" ? (
           <Button size="sm" onClick={() => navigate({ view: "new" })}>

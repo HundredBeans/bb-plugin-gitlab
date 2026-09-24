@@ -72,6 +72,8 @@ const itemSchema = z
     author: z.string(),
     labels: z.array(z.string()),
     assignees: z.array(z.string()),
+    /** Empty for every issue — GitLab has no reviewers on one. */
+    reviewers: z.array(z.string()),
     url: z.string(),
     body: z.string(),
     updatedAt: z.string(),
@@ -302,6 +304,9 @@ const gitlabItemRowSchema = z.looseObject({
   author: gitlabUserRowSchema.nullish().catch(null),
   labels: z.array(z.string()).catch([]),
   assignees: z.array(gitlabUserRowSchema).catch([]),
+  // Merge requests only; GitLab omits it on an issue, which `.catch` reads as
+  // the empty list.
+  reviewers: z.array(gitlabUserRowSchema).catch([]),
   web_url: z.string().catch(""),
   description: z.string().catch(""),
   updated_at: z.string().catch(""),
@@ -317,7 +322,6 @@ const gitlabMergeRequestRowSchema = gitlabItemRowSchema.extend({
   has_conflicts: z.boolean().catch(false),
   detailed_merge_status: z.string().catch(""),
   merge_status: z.string().catch(""),
-  reviewers: z.array(gitlabUserRowSchema).catch([]),
   head_pipeline: z
     .looseObject({
       id: z.number().int().nullable().catch(null),
@@ -405,6 +409,8 @@ interface CachedItem {
   author: string;
   labels: string[];
   assignees: string[];
+  /** Empty for every issue — GitLab has no reviewers on one. */
+  reviewers: string[];
   url: string;
   body: string;
   updatedAt: string;
@@ -652,6 +658,7 @@ function toItem(
     author: row.author?.username ?? "",
     labels: row.labels,
     assignees: usernames(row.assignees),
+    reviewers: usernames(row.reviewers),
     url: row.web_url,
     body: row.description,
     updatedAt: row.updated_at,
@@ -949,6 +956,7 @@ export default async function plugin(bb: BbPluginApi) {
        updated_at TEXT NOT NULL,
        PRIMARY KEY (project, kind, iid)
      )`,
+    `ALTER TABLE items ADD COLUMN reviewers TEXT NOT NULL DEFAULT '[]'`,
   ]);
 
   const cachedStringArraySchema = z.array(z.string()).catch([]);
@@ -966,6 +974,9 @@ export default async function plugin(bb: BbPluginApi) {
       labels: cachedStringArraySchema.parse(JSON.parse(String(row.labels))),
       assignees: cachedStringArraySchema.parse(
         JSON.parse(String(row.assignees)),
+      ),
+      reviewers: cachedStringArraySchema.parse(
+        JSON.parse(String(row.reviewers ?? "[]")),
       ),
       url: String(row.url),
       body: String(row.body),
@@ -1023,8 +1034,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   function replaceProjectRows(project: string, items: CachedItem[]): void {
     const insert = db.prepare(
-      `INSERT INTO items (project, iid, kind, title, state, draft, author, labels, assignees, url, body, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO items (project, iid, kind, title, state, draft, author, labels, assignees, reviewers, url, body, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     db.transaction(() => {
       db.prepare("DELETE FROM items WHERE project = ?").run(project);
@@ -1039,6 +1050,7 @@ export default async function plugin(bb: BbPluginApi) {
           item.author,
           JSON.stringify(item.labels),
           JSON.stringify(item.assignees),
+          JSON.stringify(item.reviewers),
           item.url,
           item.body,
           item.updatedAt,
@@ -1353,6 +1365,106 @@ export default async function plugin(bb: BbPluginApi) {
         body: row.body,
         createdAt: row.created_at,
       }));
+  }
+
+  /**
+   * The merge request raised from a branch: an open one when the branch has
+   * one, else the most recently updated. Null when the branch has none.
+   */
+  async function mergeRequestForBranch(
+    project: string,
+    branch: string,
+  ): Promise<number | null> {
+    const { path } = parseProjectRef(project);
+    const rows = gitlabItemListSchema
+      .parse(
+        await gitlabApi(
+          project,
+          `projects/${encodeURIComponent(path)}/merge_requests` +
+            `?source_branch=${encodeURIComponent(branch)}` +
+            "&per_page=10&order_by=updated_at&sort=desc",
+        ),
+      )
+      .filter((row) => row !== null);
+    return (
+      rows.find((row) => row.state === "opened")?.iid ?? rows[0]?.iid ?? null
+    );
+  }
+
+  /**
+   * The merge request a thread's own checkout sits on, found through the
+   * branch the worktree is on.
+   *
+   * BB's `environments.pullRequest` runs the GitHub CLI, so on a GitLab remote
+   * it reports nothing and the panel would have to ask the user to pick. The
+   * branch is the link that does work.
+   *
+   * A thread sitting on the repo's trunk is skipped. Such a branch can still
+   * match an old merge request that was raised *from* the trunk, and that
+   * merge request has nothing to do with the thread.
+   */
+  async function branchMergeRequest(thread: {
+    projectId: string | null;
+    environmentId: string | null;
+  }): Promise<{ project: string; iid: number } | null> {
+    if (thread.environmentId === null) return null;
+    const environment = await bb.sdk.environments.get({
+      environmentId: thread.environmentId,
+    });
+    if (!environment.isGitRepo) return null;
+    const branch = environment.branchName?.trim() ?? "";
+    if (branch.length === 0) return null;
+    const trunks = [
+      environment.defaultBranch,
+      environment.baseBranch,
+      environment.mergeBaseBranch,
+    ].map((name) => name?.trim() ?? "");
+    if (trunks.includes(branch)) return null;
+    const projects = await discoverProjects();
+    // The thread's own BB project when that project is tracked. Asking the
+    // others as well would let a branch name that exists in two repositories
+    // answer with the wrong merge request; only a thread BB cannot place at
+    // all is worth that risk.
+    const mine = projects.filter(
+      (entry) => entry.bbProjectId === thread.projectId,
+    );
+    for (const entry of mine.length > 0 ? mine : projects) {
+      try {
+        const iid = await mergeRequestForBranch(entry.project, branch);
+        if (iid !== null) return { project: entry.project, iid };
+      } catch (error) {
+        bb.log.debug(
+          `merge request lookup failed for ${entry.project} ${branch}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    return null;
+  }
+
+  /** The merge request BB itself records for a thread's environment. */
+  async function environmentMergeRequest(thread: {
+    environmentId: string | null;
+  }): Promise<{ project: string; iid: number } | null> {
+    if (thread.environmentId === null) return null;
+    try {
+      const result = await bb.sdk.environments.pullRequest({
+        environmentId: thread.environmentId,
+      });
+      const match =
+        result.outcome === "available"
+          ? result.pullRequest.url.match(
+              /^https?:\/\/([^/]+)\/(.+?)\/-\/merge_requests\/(\d+)/,
+            )
+          : null;
+      if (match === null) return null;
+      const ref = `${match[1].toLowerCase()}/${match[2]}`;
+      return isProjectRef(ref) ? { project: ref, iid: Number(match[3]) } : null;
+    } catch {
+      // BB has no answer for this environment — the branch lookup is next.
+      return null;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -1728,25 +1840,17 @@ export default async function plugin(bb: BbPluginApi) {
     async mergeRequestForThread({ threadId }) {
       try {
         const thread = await bb.sdk.threads.get({ threadId });
-        if (thread.environmentId !== null) {
-          const result = await bb.sdk.environments.pullRequest({
-            environmentId: thread.environmentId,
-          });
-          const match =
-            result.outcome === "available"
-              ? result.pullRequest.url.match(
-                  /^https?:\/\/([^/]+)\/(.+?)\/-\/merge_requests\/(\d+)/,
-                )
-              : null;
-          if (match !== null) {
-            const ref = `${match[1].toLowerCase()}/${match[2]}`;
-            if (isProjectRef(ref)) {
-              return { mergeRequest: { project: ref, iid: Number(match[3]) } };
-            }
-          }
-        }
-      } catch {
-        // no environment / MR lookup failed — fall through to spawn links
+        const recorded = await environmentMergeRequest(thread);
+        if (recorded !== null) return { mergeRequest: recorded };
+        const fromBranch = await branchMergeRequest(thread);
+        if (fromBranch !== null) return { mergeRequest: fromBranch };
+      } catch (error) {
+        // no environment / lookup failed — fall through to spawn links
+        bb.log.debug(
+          `merge request for thread ${threadId} failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       }
       const links = await listAllLinks();
       for (const [key, threadLinks] of Object.entries(links)) {
