@@ -4,16 +4,18 @@ GitLab issues and merge requests inside BB, with one-click agent dispatch.
 Self-managed instances are first-class: every host `glab` is logged into is a
 host this plugin can reach.
 
+This is a fork of
+[suiramdev/bb-plugin-gitlab](https://github.com/suiramdev/bb-plugin-gitlab)
+that also acts on merge requests from BB — approve, merge, run and retry
+pipelines, edit reviewers — and shows the conversation as a threaded timeline
+with reply and resolve.
+
 ```sh
-bb plugin install git:https://github.com/suiramdev/bb-plugin-gitlab.git@main --yes
+bb plugin install git:https://github.com/HundredBeans/bb-plugin-gitlab.git@main --yes
 ```
 
-`@main` tracks the branch head. Pin a release instead to have
-`bb plugin outdated` / `bb plugin update` follow compatible tags only:
-
-```sh
-bb plugin install 'git:https://github.com/suiramdev/bb-plugin-gitlab.git@^0.1.0' --yes
-```
+`@main` tracks the branch head. The fork has no release tags of its own yet,
+so there is no version to pin.
 
 BB clones the ref, installs production dependencies, and builds
 `dist/server.js` + `dist/app.js` itself, so nothing has to be committed built.
