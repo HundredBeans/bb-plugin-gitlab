@@ -4,13 +4,13 @@
   "description": "Browse GitLab issues and merge requests in BB, then send them to agents.",
   "license": "MIT",
   "author": "Marius Nouchet (https://github.com/suiramdev)",
-  "homepage": "https://github.com/suiramdev/bb-plugin-gitlab#readme",
+  "homepage": "https://github.com/HundredBeans/bb-plugin-gitlab#readme",
   "bugs": {
-    "url": "https://github.com/suiramdev/bb-plugin-gitlab/issues"
+    "url": "https://github.com/HundredBeans/bb-plugin-gitlab/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/suiramdev/bb-plugin-gitlab.git"
+    "url": "git+https://github.com/HundredBeans/bb-plugin-gitlab.git"
   },
   "type": "module",
   "engines": {
